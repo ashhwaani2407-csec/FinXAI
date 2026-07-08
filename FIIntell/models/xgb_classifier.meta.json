@@ -1,0 +1,26 @@
+{
+  "trained_at_utc": "2026-04-03T07:44:20.061306+00:00",
+  "enable_finbert": false,
+  "tickers_used": [
+    "TSLA",
+    "BTC-USD"
+  ],
+  "samples": {
+    "X_shape": [
+      16,
+      4
+    ],
+    "y_pos_rate": 0.375
+  },
+  "metrics": {
+    "accuracy": 0.5,
+    "roc_auc": 0.33333333333333337
+  },
+  "feature_order": [
+    "technical_score",
+    "sentiment_score",
+    "fundamentals_score",
+    "geopolitics_score"
+  ],
+  "label_definition": "y=1 if close(t+1)>close(t) else 0"
+}

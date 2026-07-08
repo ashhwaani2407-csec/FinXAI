@@ -1,0 +1,42 @@
+# FIIntell — Multi-Asset Financial Intelligence Platform
+# Python 3.11+ (3.12 recommended: latest pandas-ta tracks current pandas/numpy)
+
+# --- API layer (async) ---
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+
+# --- Dashboard ---
+streamlit>=1.40.0
+plotly>=5.24.0
+
+# --- Data ingestion ---
+yfinance>=0.2.50
+pandas>=2.3.2
+numpy>=2.2.6,<3.0.0
+nselib>=2.0.0
+
+# --- Technical analysis (installs numba/llvmlite on supported platforms) ---
+pandas-ta>=0.3.14b0
+
+# --- Machine learning ---
+xgboost>=2.1.0
+scikit-learn>=1.5.0
+joblib>=1.4.0
+
+# --- NLP (ProsusAI/finbert via HuggingFace) ---
+transformers>=4.46.0
+torch>=2.5.0
+safetensors>=0.4.0
+sentencepiece>=0.2.0
+
+# --- HTTP (GDELT, async clients) ---
+httpx>=0.27.0
+aiofiles>=24.1.0
+
+# --- Resilience (retries / rate limits) ---
+tenacity>=8.5.0
+
+# --- Config & utilities ---
+python-dotenv>=1.0.0
