@@ -1,0 +1,40 @@
+{
+  "trained_at_utc": "2026-07-09T15:01:32.264543+00:00",
+  "enable_finbert": false,
+  "tickers_used": [
+    "TSLA",
+    "AAPL",
+    "BTC-USD"
+  ],
+  "history_period": "3y",
+  "samples": {
+    "total_shape": [
+      600,
+      4
+    ],
+    "train_shape": [
+      480,
+      4
+    ],
+    "test_shape": [
+      120,
+      4
+    ],
+    "y_pos_rate_train": 0.5145833333333333,
+    "y_pos_rate_test": 0.39166666666666666
+  },
+  "metrics": {
+    "accuracy": 0.525,
+    "roc_auc": 0.4613815214223258,
+    "brier_score": 0.24741177072470155
+  },
+  "feature_order": [
+    "technical_score",
+    "sentiment_score",
+    "fundamentals_score",
+    "geopolitics_score"
+  ],
+  "label_definition": "y=1 if close(t+5)>close(t) else 0",
+  "split_strategy": "Chronological (80/20)",
+  "calibration": "CalibratedClassifierCV (sigmoid) with TimeSeriesSplit"
+}
