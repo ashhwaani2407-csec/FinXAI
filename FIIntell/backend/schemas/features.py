@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.schemas.sentiment import SentimentBreakdown
+from backend.schemas.ingestion import AssetClass
 
 class FeatureEngineeringResult(BaseModel):
     model_config = ConfigDict(frozen=False)
