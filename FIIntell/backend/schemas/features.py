@@ -12,9 +12,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.schemas.sentiment import SentimentBreakdown
+from backend.schemas.ingestion import AssetClass
+
 
 class FeatureEngineeringResult(BaseModel):
     model_config = ConfigDict(frozen=False)
+
+    asset_class: AssetClass = Field(default=AssetClass.EQUITY_GLOBAL)
 
     # Group scores used by Module C weighting.
     technical_score: float
@@ -33,9 +38,10 @@ class FeatureEngineeringResult(BaseModel):
     # Short signals to support UI "Reasoning Summary".
     signals: list[str] = Field(default_factory=list)
 
-    # Sentiment diagnostics for UI (FinBERT method + per-headline scores when available).
+    # Sentiment diagnostics (entity-linked, recency/source weighted).
     sentiment_method: str | None = None
     sentiment_per_headline_scores: list[float] = Field(default_factory=list)
+    sentiment_breakdown: SentimentBreakdown | None = None
 
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
