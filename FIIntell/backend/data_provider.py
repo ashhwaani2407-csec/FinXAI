@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -20,6 +21,7 @@ import httpx
 import pandas as pd
 import requests
 import yfinance as yf
+
 from tenacity import (
     retry,
     retry_if_exception,
@@ -388,18 +390,42 @@ class MultiAssetDataProvider:
             t = yf.Ticker(ctx.yfinance_ticker)
             news = getattr(t, "news", None) or []
             for n in news[:cap]:
-                title = (n.get("title") or "").strip()
+                # yfinance >=0.2.50 nests fields under "content"; older versions use flat keys.
+                content = n.get("content") or n
+                title = (content.get("title") or n.get("title") or "").strip()
                 if not title:
                     continue
-                pub = n.get("providerPublishTime")
+
+                # Timestamp: new format uses ISO "pubDate", old uses unix "providerPublishTime"
                 dt_utc: datetime | None = None
-                if isinstance(pub, (int, float)):
-                    dt_utc = datetime.fromtimestamp(int(pub), tz=timezone.utc)
+                pub_date_str = content.get("pubDate") or content.get("displayTime")
+                if pub_date_str and isinstance(pub_date_str, str):
+                    try:
+                        dt_utc = datetime.fromisoformat(pub_date_str.replace("Z", "+00:00"))
+                    except (ValueError, TypeError):
+                        pass
+                if dt_utc is None:
+                    pub = n.get("providerPublishTime")
+                    if isinstance(pub, (int, float)):
+                        dt_utc = datetime.fromtimestamp(int(pub), tz=timezone.utc)
+
+                # Publisher: new format nests under "provider", old uses flat "publisher"
+                provider = content.get("provider") or {}
+                publisher = provider.get("displayName") if isinstance(provider, dict) else None
+                if not publisher:
+                    publisher = n.get("publisher")
+
+                # URL: new format uses "canonicalUrl.url", old uses "link"
+                url_obj = content.get("canonicalUrl") or {}
+                url = url_obj.get("url") if isinstance(url_obj, dict) else None
+                if not url:
+                    url = n.get("link")
+
                 y_items.append(
                     NewsHeadline(
                         title=title[:500],
-                        url=n.get("link"),
-                        publisher=n.get("publisher"),
+                        url=url,
+                        publisher=publisher,
                         published_at_utc=dt_utc,
                         source=NewsSource.YFINANCE,
                     )
