@@ -16,8 +16,8 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
-from typing import Any, Iterable
+from decimal import Decimal
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -26,7 +26,9 @@ import yfinance as yf
 
 from backend.data_provider import ohlcv_bars_to_dataframe
 from backend.schemas.features import FeatureEngineeringResult
-from backend.schemas.ingestion import AssetClass, AssetIngestionResult
+from backend.schemas.ingestion import AssetClass, AssetIngestionResult, NewsHeadline
+from backend.schemas.sentiment import SentimentBreakdown
+from backend.sentiment_engine import PredictiveSentimentEngine
 from backend.settings import IngestionSettings, get_ingestion_settings
 
 logger = logging.getLogger(__name__)
@@ -68,97 +70,6 @@ def _gpr_mock(ticker: str) -> tuple[float, float]:
     return float(idx), float(score)
 
 
-_FINBERT_KEYWORDS = {
-    "bull": [
-        "surge",
-        "soars",
-        "rally",
-        "beat",
-        "beats",
-        "profit",
-        "profits",
-        "growth",
-        "upgrade",
-        "record",
-        "strong",
-        "optimistic",
-        "win",
-    ],
-    "bear": [
-        "falls",
-        "plunge",
-        "drop",
-        "miss",
-        "misses",
-        "loss",
-        "losses",
-        "downgrade",
-        "lawsuit",
-        "bankrupt",
-        "weak",
-        "pessimistic",
-        "decline",
-    ],
-}
-
-
-def _heuristic_sentiment_score(headlines: Iterable[str]) -> float:
-    bulls = 0
-    bears = 0
-    for h in headlines:
-        text = (h or "").lower()
-        if not text:
-            continue
-        if any(k in text for k in _FINBERT_KEYWORDS["bull"]):
-            bulls += 1
-        if any(k in text for k in _FINBERT_KEYWORDS["bear"]):
-            bears += 1
-    total = bulls + bears
-    if total == 0:
-        return 0.0
-    # (bull - bear) / total -> [-1..1]
-    return _clamp((bulls - bears) / total)
-
-
-@lru_cache(maxsize=1)
-def _load_finbert_pipeline(model_name: str, device: int) -> Any:
-    from transformers import pipeline
-
-    # return_all_scores=True gives stable label coverage.
-    return pipeline(
-        task="sentiment-analysis",
-        model=model_name,
-        tokenizer=model_name,
-        return_all_scores=True,
-        device=device,
-    )
-
-
-def _finbert_scores_from_pipeline(pipeline_obj: Any, headlines: list[str]) -> float | None:
-    if not headlines:
-        return None
-
-    # Batch size handled by pipeline internally; we keep it simple here.
-    out = pipeline_obj(headlines)
-    # out: list[list[{'label': 'positive', 'score':..}, ...]] when return_all_scores=True
-    label_value = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
-    per_headline: list[float] = []
-    for item in out:
-        if not isinstance(item, list):
-            continue
-        exp = 0.0
-        seen = False
-        for lab in item:
-            label = str(lab.get("label") or "").lower()
-            if label in label_value:
-                seen = True
-                exp += float(lab.get("score") or 0.0) * label_value[label]
-        if seen:
-            per_headline.append(_clamp(exp))
-    if not per_headline:
-        return None
-    return float(np.mean(per_headline))
-
 
 @dataclass(frozen=True)
 class _FundamentalSnapshot:
@@ -193,6 +104,7 @@ def _extract_fundamentals_yfinance(ticker: str) -> tuple[_FundamentalSnapshot, l
 class FeatureEngineer:
     def __init__(self, settings: IngestionSettings | None = None) -> None:
         self._s = settings or get_ingestion_settings()
+        self._sentiment = PredictiveSentimentEngine(settings=self._s)
 
     def build_features(self, ingestion: AssetIngestionResult) -> FeatureEngineeringResult:
         warnings: list[str] = []
@@ -219,7 +131,12 @@ class FeatureEngineer:
             warnings.append("insufficient history for technical indicators; using neutral technical features.")
 
         technical = self._compute_technical_scores(bars_df, ingestion.asset_class)
-        sentiment = self._compute_sentiment_score(ingestion.headlines)
+        sentiment_score, sentiment_breakdown, sentiment_warnings = self._sentiment.analyze(
+            ticker=ingestion.ticker_resolved_yfinance,
+            asset_class=ingestion.asset_class,
+            headlines=ingestion.headlines,
+        )
+        warnings.extend(sentiment_warnings)
         fundamentals, fw = self._compute_fundamentals_score(ingestion)
         warnings.extend(fw)
 
@@ -229,27 +146,35 @@ class FeatureEngineer:
         # DecisionEngine weights come later (Module C). Here we produce group scores.
         signals: list[str] = []
         signals.extend(self._technical_signals(technical, bars_df))
-        signals.extend(self._sentiment_signals(sentiment))
+        signals.extend(self._sentiment_signals(sentiment_score, sentiment_breakdown))
         signals.extend(self._fundamental_signals(fundamentals))
         signals.append(f"GPR(mock) index={gpr_index:.0f}/100")
 
         ml_vector = {}
         ml_vector.update(technical["ml_features"])
-        ml_vector["sentiment_score"] = float(sentiment["score"])
+        ml_vector["sentiment_score"] = float(sentiment_score)
+        if sentiment_breakdown is not None:
+            ml_vector["sentiment_pos_pct"] = float(sentiment_breakdown.positive_pct)
+            ml_vector["sentiment_neg_pct"] = float(sentiment_breakdown.negative_pct)
+            ml_vector["sentiment_neu_pct"] = float(sentiment_breakdown.neutral_pct)
+            ml_vector["sentiment_entity_match_rate"] = float(sentiment_breakdown.entity_match_rate)
+            ml_vector["sentiment_avg_source_quality"] = float(sentiment_breakdown.avg_source_quality)
         ml_vector["gpr_score"] = geopolitics_score
         ml_vector.update(fundamentals["ml_features"])
 
         return FeatureEngineeringResult(
+            asset_class=ingestion.asset_class,
             technical_score=float(technical["score"]),
-            sentiment_score=float(sentiment["score"]),
+            sentiment_score=float(sentiment_score),
             fundamentals_score=float(fundamentals["score"]),
             geopolitics_score=geopolitics_score,
             gpr_index=float(gpr_index),
             gpr_score=geopolitics_score,
             ml_vector=ml_vector,
             signals=signals,
-            sentiment_method=sentiment.get("method"),
-            sentiment_per_headline_scores=sentiment.get("per_headline_scores", []),
+            sentiment_method=sentiment_breakdown.method if sentiment_breakdown else None,
+            sentiment_per_headline_scores=[d.score for d in (sentiment_breakdown.headline_details if sentiment_breakdown else [])],
+            sentiment_breakdown=sentiment_breakdown,
             warnings=warnings,
             errors=errors,
             as_of_utc=datetime.now(timezone.utc),
@@ -349,68 +274,6 @@ class FeatureEngineer:
 
         return {"score": technical_score, "ml_features": ml_features}
 
-    def _compute_sentiment_score(self, headlines: list[Any]) -> dict[str, Any]:
-        # Convert headlines to plain strings
-        texts: list[str] = []
-        for h in headlines or []:
-            if isinstance(h, str):
-                texts.append(h)
-            else:
-                # NewsHeadline model
-                t = getattr(h, "title", None)
-                if t:
-                    texts.append(str(t))
-
-        if not texts:
-            return {"score": 0.0, "method": "none"}
-
-        cap = self._s.finbert_max_headlines
-        texts = texts[:cap]
-
-        if not self._s.enable_finbert:
-            # Heuristic doesn't produce per-headline scores; UI will show overall only.
-            return {"score": _heuristic_sentiment_score(texts), "method": "heuristic"}
-
-        try:
-            pipe = _load_finbert_pipeline(self._s.finbert_model, self._s.finbert_device)
-            # We want both the aggregate and (optionally) per-headline diagnostics for UI.
-            # The existing helper computes only the aggregate, so we reproduce the scoring here
-            # to also keep per-headline values.
-            out = pipe(texts)
-            label_value = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}
-            per_headline: list[float] = []
-            for item in out:
-                if not isinstance(item, list):
-                    continue
-                exp = 0.0
-                seen = False
-                for lab in item:
-                    label = str(lab.get("label") or "").lower()
-                    if label in label_value:
-                        seen = True
-                        exp += float(lab.get("score") or 0.0) * label_value[label]
-                if seen:
-                    per_headline.append(_clamp(exp))
-
-            score = float(np.mean(per_headline)) if per_headline else None
-            if score is None and self._s.sentiment_keyword_fallback:
-                return {
-                    "score": _heuristic_sentiment_score(texts),
-                    "method": "finbert_fallback_heuristic",
-                }
-            return {
-                "score": float(score if score is not None else 0.0),
-                "method": "finbert",
-                "per_headline_scores": [float(x) for x in (per_headline or [])][:cap],
-            }
-        except Exception as e:
-            logger.warning("FinBERT scoring failed: %s", e)
-            if self._s.sentiment_keyword_fallback:
-                return {
-                    "score": _heuristic_sentiment_score(texts),
-                    "method": "finbert_error_heuristic",
-                }
-            return {"score": 0.0, "method": "finbert_error"}
 
     def _compute_fundamentals_score(
         self, ingestion: AssetIngestionResult
@@ -473,13 +336,21 @@ class FeatureEngineer:
                 out.append("Price near/above upper Bollinger band (overbought bias).")
         return out
 
-    def _sentiment_signals(self, sentiment: dict[str, Any]) -> list[str]:
-        score = float(sentiment.get("score") or 0.0)
+    def _sentiment_signals(self, score: float, breakdown: SentimentBreakdown | None = None) -> list[str]:
+        out: list[str] = []
         if score >= 0.2:
-            return [f"FinBERT sentiment is bullish (score={score:.2f})."]
-        if score <= -0.2:
-            return [f"FinBERT sentiment is bearish (score={score:.2f})."]
-        return ["News sentiment is neutral to mixed."]
+            out.append(f"Sentiment is bullish (score={score:.2f}).")
+        elif score <= -0.2:
+            out.append(f"Sentiment is bearish (score={score:.2f}).")
+        else:
+            out.append("News sentiment is neutral to mixed.")
+        if breakdown and breakdown.headlines_used > 0:
+            out.append(
+                f"Based on {breakdown.headlines_used} headlines "
+                f"(+{breakdown.positive_pct:.0f}%/-{breakdown.negative_pct:.0f}%/~{breakdown.neutral_pct:.0f}%), "
+                f"entity match={breakdown.entity_match_rate:.0%}, method={breakdown.method}."
+            )
+        return out
 
     def _fundamental_signals(self, fundamentals: dict[str, Any]) -> list[str]:
         score = float(fundamentals.get("score") or 0.0)
@@ -488,4 +359,3 @@ class FeatureEngineer:
         if score <= -0.2:
             return [f"Fundamentals indicate elevated risk (score={score:.2f})."]
         return ["Fundamentals are neutral or missing."]
-
