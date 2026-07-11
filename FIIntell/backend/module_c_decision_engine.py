@@ -28,6 +28,7 @@ import numpy as np
 
 from backend.schemas.decision import DecisionLabel, DecisionResult, TradeAction
 from backend.schemas.features import FeatureEngineeringResult
+from backend.schemas.ingestion import AssetClass
 
 logger = logging.getLogger(__name__)
 
@@ -125,12 +126,12 @@ class DecisionEngine:
                 weighted = _clamp(weighted, -1.0, 1.0)
                 heur_p = (weighted + 1.0) / 2.0  # map [-1,1] -> [0,1]
 
-                alpha = float(os.getenv("FIINTELL_MODEL_BLEND", "0.55"))
+                alpha = float(os.getenv("FIINTELL_MODEL_BLEND", "0.0"))
                 alpha = float(_clamp(alpha, 0.0, 1.0))
 
                 blended_p = _clamp(alpha * proba_trade + (1.0 - alpha) * heur_p, 0.0, 1.0)
                 score = float(2.0 * blended_p - 1.0)
-                label, action = self._label_and_action_from_score(score)
+                label, action = self._label_and_action_from_score(score, features.asset_class)
                 confidence = float(_clamp(blended_p * 100.0, 0.0, 100.0))
                 return DecisionResult(
                     label=label,
@@ -164,7 +165,7 @@ class DecisionEngine:
         )
         score = _clamp(score, -1.0, 1.0)
 
-        label, action = self._label_and_action_from_score(score)
+        label, action = self._label_and_action_from_score(score, features.asset_class)
 
         # Confidence is shaped by distance from 0.0; we avoid returning 100% in heuristic mode.
         # Map abs(score) in [0..1] -> confidence in [50..95] with sigmoid smoothing.
@@ -188,12 +189,13 @@ class DecisionEngine:
             errors=[],
         )
 
-    def _label_and_action_from_score(self, score: float) -> tuple[DecisionLabel, TradeAction]:
+    def _label_and_action_from_score(self, score: float, asset_class: AssetClass) -> tuple[DecisionLabel, TradeAction]:
         score = float(_clamp(score, -1.0, 1.0))
         # Thresholds tuned to avoid over-trading on noisy signals.
-        if score >= 0.20:
+        threshold = 0.30 if asset_class in {AssetClass.CRYPTO, AssetClass.COMMODITY} else 0.20
+       if score >= threshold:
             return DecisionLabel.FRUITFUL_TRADE, TradeAction.BUY
-        if score <= -0.20:
+        if score <= -threshold:
             return DecisionLabel.RISKY_AVOID, TradeAction.SELL
         # Neutral zone
         return DecisionLabel.RISKY_AVOID, TradeAction.HOLD
