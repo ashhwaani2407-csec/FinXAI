@@ -21,7 +21,7 @@ class IngestionSettings(BaseSettings):
     gdelt_base_url: HttpUrl = Field(default="https://api.gdeltproject.org/api/v2/doc/doc")
     gdelt_mode: Literal["ArtList"] = "ArtList"
     news_headline_limit: int = Field(default=10, ge=1, le=50)
-    history_period: Literal["1y", "2y", "6mo", "3mo", "1mo", "5d"] = "1y"
+    history_period: Literal["max", "5y", "3y", "2y", "1y", "6mo", "3mo", "1mo", "5d"] = "1y"
     history_interval: Literal["1d", "1wk", "1mo"] = "1d"
 
     yfinance_max_attempts: int = Field(default=5, ge=1, le=12)
