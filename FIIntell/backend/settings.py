@@ -76,6 +76,28 @@ class IngestionSettings(BaseSettings):
         le=50,
         description="Max number of headlines to score per asset.",
     )
+    sentiment_recency_half_life_hours: float = Field(
+        default=48.0,
+        ge=6.0,
+        le=168.0,
+        description="Recency half-life: headlines 48h old get 50% weight vs fresh.",
+    )
+    sentiment_max_headline_age_hours: float = Field(
+        default=168.0,
+        ge=24.0,
+        le=720.0,
+        description="Drop headlines older than this (default 7 days).",
+    )
+    sentiment_entity_min_relevance: float = Field(
+        default=0.25,
+        ge=0.0,
+        le=1.0,
+        description="Minimum entity-link score to include a headline (when filter enabled).",
+    )
+    sentiment_enable_entity_filter: bool = Field(
+        default=True,
+        description="Prefer headlines that mention the resolved company/symbol.",
+    )
 
     # --- Module B: feature postprocessing ---
     sentiment_keyword_fallback: bool = Field(
