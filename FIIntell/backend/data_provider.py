@@ -113,6 +113,14 @@ class MultiAssetDataProvider:
         headlines, nw = self._fetch_headlines(ctx)
         warnings.extend(nw)
 
+         # India-specific enrichment (delivery %, FII/DII flows).
+        nse_delivery_pct = None
+        nse_fii_net = None
+        nse_dii_net = None
+        if ctx.asset_class == AssetClass.EQUITY_INDIA and ctx.nse_symbol:
+            nse_delivery_pct, nse_fii_net, nse_dii_net, ew = self._fetch_nse_enrichment(ctx.nse_symbol)
+            warnings.extend(ew)
+
         return AssetIngestionResult(
             ticker_requested=ctx.requested,
             ticker_resolved_yfinance=ctx.yfinance_ticker,
@@ -120,6 +128,9 @@ class MultiAssetDataProvider:
             history_source=hsrc,
             bars=bars,
             headlines=headlines,
+            nse_delivery_pct=nse_delivery_pct,
+            nse_fii_net_buy_cr=nse_fii_net,
+            nse_dii_net_buy_cr=nse_dii_net,
             warnings=warnings,
             errors=errors,
         )
@@ -325,7 +336,7 @@ class MultiAssetDataProvider:
                 continue
 
         rows.sort(key=lambda b: b.date)
-        return rows[-260:] if len(rows) > 260 else rows
+        return rows
 
     def _bars_from_nselib_df(self, df: pd.DataFrame) -> list[OHLCVBar]:
         dfn = self._scrub_nselib_columns(df)
@@ -364,7 +375,7 @@ class MultiAssetDataProvider:
             except Exception:
                 continue
 
-        return rows[-260:] if len(rows) > 260 else rows
+        return rows
 
     @staticmethod
     def _first_present(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -379,6 +390,70 @@ class MultiAssetDataProvider:
                 return lower_map[lc]
         return None
 
+    def _fetch_nse_enrichment(
+        self, nse_symbol: str
+    ) -> tuple[float | None, float | None, float | None, list[str]]:
+        """Fetch delivery % and FII/DII flows for an Indian equity."""
+        warnings: list[str] = []
+        delivery_pct: float | None = None
+        fii_net: float | None = None
+        dii_net: float | None = None
+
+        # 1. Delivery % from price_volume_and_deliverable_position_data
+        try:
+            from nselib import capital_market
+
+            end = date.today()
+            start = end - timedelta(days=30)
+            pvd = capital_market.price_volume_and_deliverable_position_data(
+                symbol=nse_symbol,
+                from_date=start.strftime("%d-%m-%Y"),
+                to_date=end.strftime("%d-%m-%Y"),
+            )
+            if pvd is not None and not pvd.empty:
+                pvd = self._scrub_nselib_columns(pvd)
+                del_col = self._first_present(
+                    pvd, ["% Dly Qt to Traded Qty", "DeliveryPercentage", "Delivery %"]
+                )
+                if del_col and del_col in pvd.columns:
+                    vals = pd.to_numeric(pvd[del_col], errors="coerce").dropna()
+                    if len(vals) > 0:
+                        delivery_pct = float(vals.iloc[-1])
+        except Exception as e:
+            logger.warning("NSE delivery %% fetch failed for %s: %s", nse_symbol, e)
+            warnings.append(f"NSE delivery % unavailable: {e!s}")
+
+        # 2. FII/DII flows
+        try:
+            from nselib import capital_market as cm
+
+            fii_dii = cm.fii_dii_trading_activity()
+            if fii_dii is not None and not fii_dii.empty:
+                fii_dii = self._scrub_nselib_columns(fii_dii)
+                # Columns typically: Category, Buy Value, Sell Value, Net Value
+                cat_col = self._first_present(fii_dii, ["Category", "category"])
+                net_col = self._first_present(
+                    fii_dii, ["Net Value(Rs Crores)", "Net Value", "NetValue"]
+                )
+                if cat_col and net_col:
+                    for _, row in fii_dii.iterrows():
+                        cat = str(row.get(cat_col, "")).upper().strip()
+                        try:
+                            net_val = float(
+                                str(row.get(net_col, "0")).replace(",", "")
+                            )
+                        except (ValueError, TypeError):
+                            net_val = 0.0
+                        if "FII" in cat or "FPI" in cat:
+                            fii_net = net_val
+                        elif "DII" in cat:
+                            dii_net = net_val
+        except Exception as e:
+            logger.warning("NSE FII/DII fetch failed: %s", e)
+            warnings.append(f"NSE FII/DII data unavailable: {e!s}")
+
+        return delivery_pct, fii_net, dii_net, warnings
+        
     def _fetch_headlines(self, ctx: _TickerContext) -> tuple[list[NewsHeadline], list[str]]:
         warnings: list[str] = []
         cap = self._s.news_headline_limit
