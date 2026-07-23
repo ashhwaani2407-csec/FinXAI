@@ -81,6 +81,12 @@ class AssetIngestionResult(BaseModel):
     history_source: HistorySource | None
     bars: list[OHLCVBar] = Field(default_factory=list)
     headlines: list[NewsHeadline] = Field(default_factory=list)
+    
+    # India-specific NSE enrichment (populated for EQUITY_INDIA only).
+    nse_delivery_pct: float | None = None        # Latest delivery % (0-100)
+    nse_fii_net_buy_cr: float | None = None      # FII net buy in ₹ crores (recent)
+    nse_dii_net_buy_cr: float | None = None      # DII net buy in ₹ crores (recent)
+
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     fetched_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
