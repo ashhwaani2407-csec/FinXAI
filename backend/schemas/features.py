@@ -43,6 +43,9 @@ class FeatureEngineeringResult(BaseModel):
     sentiment_per_headline_scores: list[float] = Field(default_factory=list)
     sentiment_breakdown: SentimentBreakdown | None = None
 
+    # Market regime (bull/bear/sideways) from technical analysis.
+    market_regime: str = Field(default="sideways")
+
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 

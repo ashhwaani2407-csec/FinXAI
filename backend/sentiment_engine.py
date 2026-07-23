@@ -380,9 +380,9 @@ def _aggregate_weighted(details: list[HeadlineSentimentDetail]) -> SentimentBrea
             neu_w += w
 
     score = _clamp(score_sum / total_w)
-    pos_pct = 100.0 * pos_w / total_w
-    neg_pct = 100.0 * neg_w / total_w
-    neu_pct = 100.0 * neu_w / total_w
+    pos_pct = min(100.0 * pos_w / total_w, 100.0)
+    neg_pct = min(100.0 * neg_w / total_w, 100.0)
+    neu_pct = min(100.0 * neu_w / total_w, 100.0)
 
     return SentimentBreakdown(
         method="weighted",
