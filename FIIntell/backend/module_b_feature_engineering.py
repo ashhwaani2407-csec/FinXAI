@@ -222,6 +222,7 @@ class FeatureEngineer:
             sentiment_method=sentiment_breakdown.method if sentiment_breakdown else None,
             sentiment_per_headline_scores=[d.score for d in (sentiment_breakdown.headline_details if sentiment_breakdown else [])],
             sentiment_breakdown=sentiment_breakdown,
+            market_regime=regime_str,
             warnings=warnings,
             errors=errors,
             as_of_utc=datetime.now(timezone.utc),
@@ -269,7 +270,7 @@ class FeatureEngineer:
             "obv": 0.0, "obv_slope": 0.0, "relative_volume": 0.0,
             "atr14": 0.0, "atr_pct": 0.0, "hist_volatility_20d": 0.0,
             "high_52w": 0.0, "low_52w": 0.0, "dist_to_high_pct": 0.0, "dist_to_low_pct": 0.0,
-            "regime": "sideways",
+            "regime_encoded": 0.0,
         }
         
         if close.empty or len(close) < 50:
@@ -658,7 +659,8 @@ class FeatureEngineer:
         bb_lower = ml.get("bb_lower", 0.0)
         bb_upper = ml.get("bb_upper", 0.0)
         last_close = ml.get("last_close", 0.0)
-        regime = ml.get("regime", "sideways")
+        regime_enc = ml.get("regime_encoded", 0.0)
+        regime = "bull" if regime_enc == 1.0 else ("bear" if regime_enc == -1.0 else "sideways")
         sma50 = ml.get("sma50", 0.0)
         sma200 = ml.get("sma200", 0.0)
         adx = ml.get("adx", 0.0)
