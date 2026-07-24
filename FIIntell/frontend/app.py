@@ -110,6 +110,36 @@ def run_batch_pipeline(tickers: list[str], use_finbert: bool):
     return {"items": items}
 
 
+def run_backtest_pipeline(ticker: str, lookback_days: int, use_finbert: bool):
+    backend_url = os.getenv("FIINTELL_BACKEND_URL", "").strip().rstrip("/")
+    if backend_url:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(90.0)) as client:
+                r = client.post(
+                    f"{backend_url}/backtest",
+                    json={"ticker": ticker, "lookback_days": lookback_days, "enable_finbert": use_finbert},
+                )
+                r.raise_for_status()
+                return r.json()
+        except Exception:
+            pass
+
+    return {"error": "Backend backtest endpoint unavailable."}
+
+
+def get_recent_audit(limit: int = 20):
+    backend_url = os.getenv("FIINTELL_BACKEND_URL", "").strip().rstrip("/")
+    if backend_url:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(12.0)) as client:
+                r = client.get(f"{backend_url}/audit/recent", params={"limit": limit})
+                r.raise_for_status()
+                return r.json().get("items", [])
+        except Exception:
+            pass
+    return []
+
+
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def search_symbols(query: str, limit: int = 25, asset_class: str | None = None):
     backend_url = os.getenv("FIINTELL_BACKEND_URL", "").strip().rstrip("/")
@@ -180,7 +210,7 @@ def main():
 
     # Sidebar
     st.sidebar.header("Asset Selector")
-    mode = st.sidebar.radio("Analysis Mode", ["Single", "Batch"], horizontal=True)
+    mode = st.sidebar.radio("Analysis Mode", ["Single", "Batch", "Backtest"], horizontal=True)
     asset_class_filter = st.sidebar.selectbox("Asset Class", ["Stocks", "Bonds", "Crypto", "Commodities"])
     query = st.sidebar.text_input("Search by company/common name", value="")
     found = search_symbols(query, limit=25, asset_class=asset_class_filter)
@@ -345,6 +375,51 @@ def main():
                         if idx < len(per_headline):
                             s = f" · sentiment={per_headline[idx]:+.2f}"
                         st.markdown(f"- **{h.source.value}**: {h.title[:180]}{ts}{s}")
+        return
+
+    if mode == "Backtest":
+        selected_label = st.sidebar.selectbox(
+            "Select Backtest Ticker",
+            labels if labels else ["No matches. Try another company name."],
+            key=f"fiintell_backtest_pick_{asset_class_filter}",
+        )
+        if not labels:
+            st.warning("No symbols found. Try examples like Tesla, Reliance, Infosys, Tata, Apple.")
+            return
+        ticker = options_map[selected_label]
+        lookback_days = st.sidebar.slider("Lookback (days)", min_value=30, max_value=180, value=90, step=30)
+
+        with st.spinner("Running backtest..."):
+            result = run_backtest_pipeline(ticker, lookback_days, use_finbert)
+        if result.get("error"):
+            st.error(result["error"])
+            return
+
+        pnl_curve = result.get("pnl_curve") or []
+        if pnl_curve:
+            st.subheader("Equity Curve")
+            pnl_df = pd.DataFrame({"step": list(range(len(pnl_curve))), "equity": pnl_curve})
+            fig = go.Figure(data=[go.Scatter(x=pnl_df["step"], y=pnl_df["equity"], mode="lines")])
+            fig.update_layout(height=320, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("Backtest Summary")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Final Equity", f"${result.get('final_equity', 0.0):,.0f}")
+        c2.metric("Total Return", f"{result.get('total_return_pct', 0.0):.2f}%")
+        c3.metric("Signals", result.get("signal_count", 0))
+
+        hit_rates = result.get("hit_rates", {})
+        overall = hit_rates.get("overall", {})
+        if overall:
+            st.subheader("Hit Rate Table")
+            st.dataframe(pd.DataFrame.from_dict(overall, orient="index"), use_container_width=True)
+
+        audit_rows = get_recent_audit(limit=20)
+        if audit_rows:
+            st.subheader("Recent Audit Log")
+            audit_df = pd.DataFrame(audit_rows)
+            st.dataframe(audit_df, use_container_width=True)
         return
 
     # Batch mode
