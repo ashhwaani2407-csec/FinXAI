@@ -131,8 +131,8 @@ class DecisionEngine:
 
                 blended_p = _clamp(alpha * proba_trade + (1.0 - alpha) * heur_p, 0.0, 1.0)
                 score = float(2.0 * blended_p - 1.0)
-                label, action = self._label_and_action_from_score(score, features.asset_class)
                 confidence = float(_clamp(blended_p * 100.0, 0.0, 100.0))
+                label, action = self._label_and_action_from_score(score, features.asset_class, confidence)
                 return DecisionResult(
                     label=label,
                     action=action,
@@ -165,12 +165,12 @@ class DecisionEngine:
         )
         score = _clamp(score, -1.0, 1.0)
 
-        label, action = self._label_and_action_from_score(score, features.asset_class)
-
         # Confidence is shaped by distance from 0.0; we avoid returning 100% in heuristic mode.
         # Map abs(score) in [0..1] -> confidence in [50..95] with sigmoid smoothing.
         conf = 50.0 + 45.0 * _sigmoid(4.0 * abs(score))  # 50..~95
         conf = float(_clamp(conf, 0.0, 100.0))
+
+        label, action = self._label_and_action_from_score(score, features.asset_class, conf)
 
         # Add compact explanation of the weight mix for transparency.
         reasoning.append(
@@ -189,15 +189,43 @@ class DecisionEngine:
             errors=[],
         )
 
-    def _label_and_action_from_score(self, score: float, asset_class: AssetClass) -> tuple[DecisionLabel, TradeAction]:
+    def _label_and_action_from_score(
+        self,
+        score: float,
+        asset_class: AssetClass,
+        confidence_pct: float | None = None,
+    ) -> tuple[DecisionLabel, TradeAction]:
         score = float(_clamp(score, -1.0, 1.0))
+        confidence = float(_clamp(confidence_pct or 0.0, 0.0, 100.0))
+
         # Thresholds tuned to avoid over-trading on noisy signals.
         threshold = 0.30 if asset_class in {AssetClass.CRYPTO, AssetClass.COMMODITY} else 0.20
-        if score >= threshold:
+        confidence_gate = 60.0
+        moderate_confidence_gate = 50.0
+        follow_through_threshold = threshold * 0.30
+        high_confidence_threshold = threshold * 0.20
+
+        # Strong directional actions require both a directional composite score and enough confidence.
+        if score >= threshold and confidence >= confidence_gate:
             return DecisionLabel.FRUITFUL_TRADE, TradeAction.BUY
-        if score <= -threshold:
+        if score <= -threshold and confidence >= confidence_gate:
             return DecisionLabel.RISKY_AVOID, TradeAction.SELL
-        # Neutral zone
+
+        # If the market signal is only mildly directional, confidence can still support a
+        # directional action instead of always collapsing into HOLD when the model is leaning one way.
+        if confidence >= moderate_confidence_gate and score >= follow_through_threshold:
+            return DecisionLabel.FRUITFUL_TRADE, TradeAction.BUY
+        if confidence >= moderate_confidence_gate and score <= -follow_through_threshold:
+            return DecisionLabel.RISKY_AVOID, TradeAction.SELL
+
+        # High-confidence but weakly directional scores can still be acted on when it is clearly
+        # leaning in one direction, as long as the score is above a lightweight follow-through floor.
+        if confidence >= 72.0 and score >= high_confidence_threshold:
+            return DecisionLabel.FRUITFUL_TRADE, TradeAction.BUY
+        if confidence >= 72.0 and score <= -high_confidence_threshold:
+            return DecisionLabel.RISKY_AVOID, TradeAction.SELL
+
+        # Neutral zone: too weak to justify a directional action.
         return DecisionLabel.RISKY_AVOID, TradeAction.HOLD
 
     def _try_load_model(self) -> None:

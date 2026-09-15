@@ -16,6 +16,12 @@ class RecommendRequest(BaseModel):
     enable_finbert: bool = True
 
 
+class BacktestRequest(BaseModel):
+    ticker: str = Field(min_length=1)
+    lookback_days: int = Field(default=90, ge=30, le=180)
+    enable_finbert: bool = True
+
+
 class RecommendResponse(BaseModel):
     model_config = ConfigDict(frozen=False)
 

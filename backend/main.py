@@ -13,10 +13,13 @@ import os
 
 from fastapi import FastAPI, HTTPException
 
+from backend.audit_logger import backfill_forward_returns, get_audit_stats, get_recent_audit, log_recommendation
+from backend.backtester import run_backtest
 from backend.data_provider import MultiAssetDataProvider
 from backend.module_b_feature_engineering import FeatureEngineer
 from backend.module_c_decision_engine import DecisionEngine
 from backend.schemas.recommendation import (
+    BacktestRequest,
     HealthResponse,
     RecommendBatchRequest,
     RecommendBatchResponse,
@@ -51,6 +54,7 @@ def recommend(req: RecommendRequest) -> RecommendResponse:
 
         features = FeatureEngineer(settings=ingestion_settings).build_features(ingestion)
         decision = DecisionEngine().decide(features)
+        log_recommendation(ingestion, features, decision)
 
         return RecommendResponse(
             ingestion=ingestion,
@@ -81,6 +85,7 @@ def _run_pipeline_for_ticker(ticker: str, enable_finbert: bool) -> RecommendBatc
 
         features = FeatureEngineer(settings=ingestion_settings).build_features(ingestion)
         decision = DecisionEngine().decide(features)
+        log_recommendation(ingestion, features, decision)
 
         return RecommendBatchItem(
             ticker=ticker,
@@ -119,6 +124,31 @@ async def recommend_batch(req: RecommendBatchRequest) -> RecommendBatchResponse:
     tasks = [_guarded(t) for t in req.tickers]
     items = await asyncio.gather(*tasks)
     return RecommendBatchResponse(items=items)
+
+
+@app.post("/backtest")
+def backtest(req: BacktestRequest) -> dict:
+    try:
+        return run_backtest(req.ticker, lookback_days=req.lookback_days, enable_finbert=req.enable_finbert)
+    except Exception as e:
+        logger.exception("backtest failed for ticker=%s", req.ticker)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/audit/stats")
+def audit_stats() -> dict:
+    return get_audit_stats()
+
+
+@app.get("/audit/recent")
+def audit_recent(limit: int = 20) -> dict:
+    return {"items": get_recent_audit(limit=max(1, min(limit, 100)))}
+
+
+@app.post("/audit/backfill")
+def audit_backfill() -> dict:
+    updated = backfill_forward_returns()
+    return {"updated": updated}
 
 
 @app.get("/symbols/search", response_model=SymbolSearchResponse)

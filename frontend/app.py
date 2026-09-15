@@ -6,6 +6,8 @@ import streamlit as st
 import httpx
 import yfinance as yf
 
+from backend.audit_logger import get_recent_audit as _audit_recent_local, get_audit_stats as _audit_stats_local
+from backend.backtester import run_backtest
 from backend.data_provider import MultiAssetDataProvider, ohlcv_bars_to_dataframe
 from backend.module_b_feature_engineering import FeatureEngineer
 from backend.module_c_decision_engine import DecisionEngine
@@ -110,6 +112,44 @@ def run_batch_pipeline(tickers: list[str], use_finbert: bool):
     return {"items": items}
 
 
+def run_backtest_pipeline(ticker: str, lookback_days: int, use_finbert: bool):
+    backend_url = os.getenv("FIINTELL_BACKEND_URL", "").strip().rstrip("/")
+    if backend_url:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(180.0)) as client:
+                r = client.post(
+                    f"{backend_url}/backtest",
+                    json={"ticker": ticker, "lookback_days": lookback_days, "enable_finbert": use_finbert},
+                )
+                r.raise_for_status()
+                return r.json()
+        except Exception:
+            pass
+
+    # Local fallback — run backtest directly without the backend API.
+    try:
+        return run_backtest(ticker, lookback_days=lookback_days, enable_finbert=use_finbert)
+    except Exception as e:
+        return {"error": f"Backtest failed: {e!s}"}
+
+
+def get_recent_audit(limit: int = 20):
+    backend_url = os.getenv("FIINTELL_BACKEND_URL", "").strip().rstrip("/")
+    if backend_url:
+        try:
+            with httpx.Client(timeout=httpx.Timeout(12.0)) as client:
+                r = client.get(f"{backend_url}/audit/recent", params={"limit": limit})
+                r.raise_for_status()
+                return r.json().get("items", [])
+        except Exception:
+            pass
+    # Local fallback.
+    try:
+        return _audit_recent_local(limit=limit)
+    except Exception:
+        return []
+
+
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def search_symbols(query: str, limit: int = 25, asset_class: str | None = None):
     backend_url = os.getenv("FIINTELL_BACKEND_URL", "").strip().rstrip("/")
@@ -180,7 +220,7 @@ def main():
 
     # Sidebar
     st.sidebar.header("Asset Selector")
-    mode = st.sidebar.radio("Analysis Mode", ["Single", "Batch"], horizontal=True)
+    mode = st.sidebar.radio("Analysis Mode", ["Single", "Batch", "Backtest"], horizontal=True)
     asset_class_filter = st.sidebar.selectbox("Asset Class", ["Stocks", "Bonds", "Crypto", "Commodities"])
     query = st.sidebar.text_input("Search by company/common name", value="")
     found = search_symbols(query, limit=25, asset_class=asset_class_filter)
@@ -345,6 +385,209 @@ def main():
                         if idx < len(per_headline):
                             s = f" · sentiment={per_headline[idx]:+.2f}"
                         st.markdown(f"- **{h.source.value}**: {h.title[:180]}{ts}{s}")
+        return
+
+    if mode == "Backtest":
+        selected_label = st.sidebar.selectbox(
+            "Select Backtest Ticker",
+            labels if labels else ["No matches. Try another company name."],
+            key=f"fiintell_backtest_pick_{asset_class_filter}",
+        )
+        if not labels:
+            st.warning("No symbols found. Try examples like Tesla, Reliance, Infosys, Tata, Apple.")
+            return
+        ticker = options_map[selected_label]
+        lookback_days = st.sidebar.slider("Lookback (days)", min_value=30, max_value=180, value=90, step=30)
+        run_bt = st.sidebar.button("Run Backtest", type="primary")
+
+        if not run_bt:
+            st.info("Select a ticker and lookback period, then click **Run Backtest** to simulate paper trading.")
+            return
+
+        with st.spinner(f"Running {lookback_days}-day backtest on {ticker}... (this may take a minute)"):
+            result = run_backtest_pipeline(ticker, lookback_days, use_finbert)
+        if result.get("error"):
+            st.error(result["error"])
+            return
+
+        # --- Summary Metrics ---
+        st.subheader(f"📊 Backtest Results — {result.get('ticker', ticker)}")
+        final_eq = result.get("final_equity", 10000.0)
+        total_ret = result.get("total_return_pct", 0.0)
+        signal_count = result.get("signal_count", 0)
+        ret_color = "#22c55e" if total_ret >= 0 else "#ef4444"
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Starting Capital", "$10,000")
+        c2.metric("Final Equity", f"${final_eq:,.0f}")
+        c3.metric("Total Return", f"{total_ret:+.2f}%")
+        c4.metric("Total Signals", signal_count)
+
+        # --- Equity Curve ---
+        pnl_curve = result.get("pnl_curve") or []
+        signals = result.get("signals") or []
+
+        if pnl_curve:
+            st.subheader("💰 Equity Curve")
+            pnl_df = pd.DataFrame({"step": list(range(len(pnl_curve))), "equity": pnl_curve})
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(
+                x=pnl_df["step"], y=pnl_df["equity"],
+                mode="lines", name="Portfolio Equity",
+                line=dict(color=ret_color, width=2.5),
+                fill="tozeroy", fillcolor="rgba(34,197,94,0.08)" if total_ret >= 0 else "rgba(239,68,68,0.08)",
+            ))
+            fig_eq.add_hline(y=10000, line_dash="dash", line_color="rgba(255,255,255,0.3)", annotation_text="Start $10k")
+            fig_eq.update_layout(
+                height=320, margin=dict(l=10, r=10, t=30, b=10),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#E3E3E3"),
+                xaxis=dict(title="Trading Day", gridcolor="rgba(255,255,255,0.06)"),
+                yaxis=dict(title="Equity ($)", gridcolor="rgba(255,255,255,0.06)"),
+            )
+            st.plotly_chart(fig_eq, use_container_width=True)
+
+        # --- Price Chart with Signal Markers ---
+        if signals:
+            st.subheader("📈 Price Chart with Signals")
+            sig_df = pd.DataFrame(signals)
+            sig_df["date"] = pd.to_datetime(sig_df["date"])
+
+            # Fetch price data to overlay on candlestick
+            try:
+                ingestion_settings = IngestionSettings(enable_finbert=False)
+                provider = MultiAssetDataProvider(settings=ingestion_settings)
+                ing = provider.ingest(ticker)
+                price_df = _bars_to_plotly_df(ing.bars)
+
+                if not price_df.empty:
+                    # Filter to backtest period
+                    min_date = sig_df["date"].min()
+                    price_df = price_df.loc[price_df.index >= min_date]
+
+                    fig_price = go.Figure()
+                    fig_price.add_trace(go.Candlestick(
+                        x=price_df.index,
+                        open=price_df["open"].astype(float),
+                        high=price_df["high"].astype(float),
+                        low=price_df["low"].astype(float),
+                        close=price_df["close"].astype(float),
+                        name="OHLC",
+                    ))
+
+                    # BUY markers
+                    buys = sig_df[sig_df["action"] == "BUY"]
+                    if not buys.empty:
+                        # Get close prices for buy dates from price_df
+                        buy_prices = []
+                        for d in buys["date"]:
+                            match = price_df.index[price_df.index <= d]
+                            buy_prices.append(float(price_df.loc[match[-1], "low"]) * 0.98 if len(match) > 0 else None)
+                        fig_price.add_trace(go.Scatter(
+                            x=buys["date"], y=buy_prices,
+                            mode="markers", name="BUY",
+                            marker=dict(symbol="triangle-up", size=12, color="#22c55e"),
+                        ))
+
+                    # SELL markers
+                    sells = sig_df[sig_df["action"] == "SELL"]
+                    if not sells.empty:
+                        sell_prices = []
+                        for d in sells["date"]:
+                            match = price_df.index[price_df.index <= d]
+                            sell_prices.append(float(price_df.loc[match[-1], "high"]) * 1.02 if len(match) > 0 else None)
+                        fig_price.add_trace(go.Scatter(
+                            x=sells["date"], y=sell_prices,
+                            mode="markers", name="SELL",
+                            marker=dict(symbol="triangle-down", size=12, color="#ef4444"),
+                        ))
+
+                    fig_price.update_layout(
+                        height=420, margin=dict(l=10, r=10, t=30, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#E3E3E3"),
+                        xaxis=dict(gridcolor="rgba(255,255,255,0.06)"),
+                        yaxis=dict(gridcolor="rgba(255,255,255,0.06)"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    )
+                    st.plotly_chart(fig_price, use_container_width=True)
+            except Exception:
+                pass  # If price fetch fails, just skip the chart
+
+        # --- Hit Rate Table ---
+        hit_rates = result.get("hit_rates", {})
+        overall = hit_rates.get("overall", {})
+        by_asset = hit_rates.get("by_asset_class", {})
+
+        if overall:
+            st.subheader("🎯 Hit Rate — Precision & Recall by Action")
+            hr_rows = []
+            for action, data in overall.items():
+                hr_rows.append({
+                    "Action": action,
+                    "Signals": data.get("support", 0),
+                    "Hit Rate": f"{data.get('hit_rate', 0) * 100:.1f}%",
+                    "Precision": f"{data.get('precision', 0) * 100:.1f}%",
+                    "Recall": f"{data.get('recall', 0) * 100:.1f}%",
+                })
+            st.dataframe(pd.DataFrame(hr_rows), use_container_width=True, hide_index=True)
+
+        if by_asset:
+            with st.expander("Hit Rate by Asset Class", expanded=False):
+                for asset_cls, action_map in by_asset.items():
+                    st.caption(f"**{asset_cls}**")
+                    ac_rows = []
+                    for action, data in action_map.items():
+                        ac_rows.append({
+                            "Action": action,
+                            "Signals": data.get("support", 0),
+                            "Hit Rate": f"{data.get('hit_rate', 0) * 100:.1f}%",
+                            "Precision": f"{data.get('precision', 0) * 100:.1f}%",
+                        })
+                    st.dataframe(pd.DataFrame(ac_rows), use_container_width=True, hide_index=True)
+
+        # --- Detailed Signals Table ---
+        if signals:
+            st.subheader("📋 Signal Details")
+            sig_display = []
+            for s in signals:
+                correct = s.get("correct")
+                if correct is True:
+                    outcome = "✅ Correct"
+                elif correct is False:
+                    outcome = "❌ Wrong"
+                else:
+                    outcome = "⏳ Pending"
+                sig_display.append({
+                    "Date": s.get("date", "")[:10],
+                    "Action": s.get("action", ""),
+                    "Score": round(s.get("score", 0), 3),
+                    "Confidence": f"{s.get('confidence_pct', 0):.1f}%",
+                    "Return 1d": f"{s.get('return_1d_pct', 0):.2f}%" if s.get("return_1d_pct") is not None else "—",
+                    "Return 5d": f"{s.get('return_5d_pct', 0):.2f}%" if s.get("return_5d_pct") is not None else "—",
+                    "Return 20d": f"{s.get('return_20d_pct', 0):.2f}%" if s.get("return_20d_pct") is not None else "—",
+                    "Outcome": outcome,
+                })
+            st.dataframe(pd.DataFrame(sig_display), use_container_width=True, hide_index=True)
+
+        # --- Recent Audit Log ---
+        with st.expander("Recent Audit Log (last 20 recommendations)", expanded=False):
+            audit_rows = get_recent_audit(limit=20)
+            if audit_rows:
+                audit_display = []
+                for row in audit_rows:
+                    audit_display.append({
+                        "Time": str(row.get("timestamp_utc", ""))[:19],
+                        "Ticker": row.get("ticker", ""),
+                        "Action": row.get("action", ""),
+                        "Confidence": f"{row.get('confidence_pct', 0):.1f}%",
+                        "Score": round(row.get("score", 0), 3),
+                        "Return 1d": f"{row.get('return_1d_pct', 0):.2f}%" if row.get("return_1d_pct") is not None else "—",
+                        "Return 5d": f"{row.get('return_5d_pct', 0):.2f}%" if row.get("return_5d_pct") is not None else "—",
+                    })
+                st.dataframe(pd.DataFrame(audit_display), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No audit logs yet. Make some recommendations first.")
         return
 
     # Batch mode
