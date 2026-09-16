@@ -25,7 +25,8 @@ from sklearn.calibration import CalibratedClassifierCV
 from xgboost import XGBClassifier
 
 from backend.data_provider import MultiAssetDataProvider, ohlcv_bars_to_dataframe
-from backend.module_b_feature_engineering import _gpr_mock, FeatureEngineer
+from backend.geopolitics_engine import compute_geopolitics
+from backend.module_b_feature_engineering import FeatureEngineer
 from backend.settings import IngestionSettings
 
 logger = logging.getLogger(__name__)
@@ -64,10 +65,10 @@ def build_dataset_for_ticker(
     )
     s = float(s)
     fundamentals, _fw = fe._compute_fundamentals_score(ingestion)  # noqa: SLF001
-    _gpr_index, gpr_score = _gpr_mock(ingestion.ticker_resolved_yfinance)
+    geo = compute_geopolitics(ingestion.asset_class)
 
     f = float(fundamentals.get("score") or 0.0)
-    g = float(gpr_score)
+    g = float(geo.risk_score)
 
     # We need close(t+5), so t must be up to n-6.
     last_t = n - 6
