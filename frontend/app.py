@@ -362,7 +362,7 @@ def main():
                     "Technical": round(features.technical_score, 3),
                     "Sentiment": round(features.sentiment_score, 3),
                     "Fundamentals": round(features.fundamentals_score, 3),
-                    "Geopolitics (mock GPR)": round(features.geopolitics_score, 3),
+                    "Geopolitics (VIX/Oil/Macro)": round(features.geopolitics_score, 3),
                 }
             )
 

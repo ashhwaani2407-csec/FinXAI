@@ -11,6 +11,7 @@ Production notes:
 
 from __future__ import annotations
 
+
 import hashlib
 import logging
 import math
@@ -25,6 +26,7 @@ import pandas_ta as ta
 import yfinance as yf
 
 from backend.data_provider import ohlcv_bars_to_dataframe
+from backend.geopolitics_engine import compute_geopolitics, GeopoliticsResult
 from backend.schemas.features import FeatureEngineeringResult
 from backend.schemas.ingestion import AssetClass, AssetIngestionResult, NewsHeadline
 from backend.schemas.sentiment import SentimentBreakdown
@@ -63,15 +65,6 @@ def _score_from_ratio(value: float | None, ref_low: float, ref_high: float) -> f
     t = (value - ref_low) / (ref_high - ref_low)  # 0..1
     return _clamp(1.0 - 2.0 * t)
 
-
-def _gpr_mock(ticker: str) -> tuple[float, float]:
-    """Deterministic mock GPR index (0..100) based on ticker string."""
-    s = (ticker or "").upper().strip().encode("utf-8", errors="ignore")
-    digest = hashlib.sha256(s).hexdigest()
-    n = int(digest[:8], 16)  # 0..2^32-1
-    idx = (n % 101)  # 0..100
-    score = (idx - 50.0) / 50.0  # -1..1
-    return float(idx), float(score)
 
 
 # ---------------------------------------------------------------------------
@@ -195,15 +188,17 @@ class FeatureEngineer:
         fundamentals, fw = self._compute_fundamentals_score(ingestion)
         warnings.extend(fw)
 
-        gpr_index, gpr_score = _gpr_mock(ingestion.ticker_resolved_yfinance)
-        geopolitics_score = float(gpr_score)
+        geo = compute_geopolitics(ingestion.asset_class)
+        geopolitics_score = float(geo.risk_score)
+        gpr_index = float(geo.risk_index)
+        warnings.extend(geo.warnings)
 
         # DecisionEngine weights come later (Module C). Here we produce group scores.
         signals: list[str] = []
         signals.extend(self._technical_signals(technical, bars_df))
         signals.extend(self._sentiment_signals(sentiment_score, sentiment_breakdown))
         signals.extend(self._fundamental_signals(fundamentals))
-        signals.append(f"GPR(mock) index={gpr_index:.0f}/100")
+        signals.extend(self._geopolitics_signals(geo))
 
         ml_vector = {}
         ml_vector.update(technical["ml_features"])
@@ -215,6 +210,15 @@ class FeatureEngineer:
             ml_vector["sentiment_entity_match_rate"] = float(sentiment_breakdown.entity_match_rate)
             ml_vector["sentiment_avg_source_quality"] = float(sentiment_breakdown.avg_source_quality)
         ml_vector["gpr_score"] = geopolitics_score
+        ml_vector["gpr_index"] = gpr_index
+        ml_vector["vix_level"] = float(geo.vix_level)
+        ml_vector["vix_percentile"] = float(geo.vix_percentile)
+        ml_vector["oil_change_5d_pct"] = float(geo.oil_change_5d_pct)
+        ml_vector["oil_shock"] = 1.0 if geo.oil_shock else 0.0
+        if ingestion.asset_class == AssetClass.EQUITY_INDIA:
+            ml_vector["india_vix_level"] = float(geo.india_vix_level)
+            ml_vector["usdinr_change_5d_pct"] = float(geo.usdinr_change_5d_pct)
+            ml_vector["usdinr_stress"] = 1.0 if geo.usdinr_stress else 0.0
         ml_vector.update(fundamentals["ml_features"])
 
         regime = technical["ml_features"].get("regime_encoded", 0.0)
@@ -765,5 +769,50 @@ class FeatureEngineer:
         if nse_fii != 0.0:
             direction = "buying" if nse_fii > 0 else "selling"
             out.append(f"FII net {direction}: ₹{abs(nse_fii):.0f} Cr.")
+
+        return out
+
+    def _geopolitics_signals(self, geo: GeopoliticsResult) -> list[str]:
+        out: list[str] = []
+
+        # Overall risk bucket
+        bucket_emoji = {
+            "low": "🟢", "medium": "🟡", "high": "🟠", "extreme": "🔴",
+        }
+        emoji = bucket_emoji.get(geo.risk_bucket, "⚪")
+        out.append(
+            f"Geopolitical risk: {emoji} {geo.risk_bucket.upper()} "
+            f"(index={geo.risk_index:.0f}/100, score={geo.risk_score:+.2f})"
+        )
+
+        # VIX detail
+        if geo.vix_level > 0:
+            if geo.vix_level > 30:
+                out.append(f"VIX at {geo.vix_level:.1f} — elevated fear, high volatility expected.")
+            elif geo.vix_level > 20:
+                out.append(f"VIX at {geo.vix_level:.1f} — above-average caution.")
+            elif geo.vix_level < 15:
+                out.append(f"VIX at {geo.vix_level:.1f} — markets are calm.")
+
+        # Oil shock
+        if geo.oil_shock:
+            direction = "spike" if geo.oil_change_5d_pct > 0 else "crash"
+            out.append(
+                f"Oil {direction}: {geo.oil_change_5d_pct:+.1f}% in 5 days — "
+                f"geopolitical/supply risk signal."
+            )
+
+        # India-specific
+        if geo.india_vix_level > 0:
+            if geo.india_vix_level > 20:
+                out.append(f"India VIX at {geo.india_vix_level:.1f} — domestic volatility elevated.")
+            elif geo.india_vix_level < 12:
+                out.append(f"India VIX at {geo.india_vix_level:.1f} — domestic calm.")
+
+        if geo.usdinr_stress:
+            out.append(
+                f"USD/INR stress: INR depreciated {geo.usdinr_change_5d_pct:+.2f}% in 5 days — "
+                f"FII outflow / macro risk."
+            )
 
         return out
