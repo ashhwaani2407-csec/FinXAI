@@ -8,12 +8,13 @@ Production notes:
 - Keep the feature contract stable (do not reorder/remove keys without versioning).
 - All external calls are best-effort; failures degrade with warnings/errors.
 """
+
 from __future__ import annotations
+
 
 import hashlib
 import logging
 import math
-
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -25,6 +26,7 @@ import pandas_ta as ta
 import yfinance as yf
 
 from backend.data_provider import ohlcv_bars_to_dataframe
+from backend.geopolitics_engine import compute_geopolitics, GeopoliticsResult
 from backend.schemas.features import FeatureEngineeringResult
 from backend.schemas.ingestion import AssetClass, AssetIngestionResult, NewsHeadline
 from backend.schemas.sentiment import SentimentBreakdown
@@ -32,6 +34,7 @@ from backend.sentiment_engine import PredictiveSentimentEngine
 from backend.settings import IngestionSettings, get_ingestion_settings
 
 logger = logging.getLogger(__name__)
+
 
 def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     if x is None or isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
@@ -63,19 +66,10 @@ def _score_from_ratio(value: float | None, ref_low: float, ref_high: float) -> f
     return _clamp(1.0 - 2.0 * t)
 
 
-def _gpr_mock(ticker: str) -> tuple[float, float]:
-    """Deterministic mock GPR index (0..100) based on ticker string."""
-    s = (ticker or "").upper().strip().encode("utf-8", errors="ignore")
-    digest = hashlib.sha256(s).hexdigest()
-    n = int(digest[:8], 16)  # 0..2^32-1
-    idx = (n % 101)  # 0..100
-    score = (idx - 50.0) / 50.0  # -1..1
-    return float(idx), float(score)
-    
+
 # ---------------------------------------------------------------------------
 # Sector P/E reference table (fallback when yfinance doesn't provide sectorPE)
 # ---------------------------------------------------------------------------
-
 _SECTOR_PE_DEFAULTS: dict[str, float] = {
     "technology": 30.0,
     "communication services": 22.0,
@@ -90,6 +84,8 @@ _SECTOR_PE_DEFAULTS: dict[str, float] = {
     "real estate": 25.0,
 }
 _DEFAULT_SECTOR_PE = 20.0
+
+
 @dataclass(frozen=True)
 class _FundamentalSnapshot:
     pe_ratio: float | None
@@ -114,7 +110,7 @@ def _extract_fundamentals_yfinance(ticker: str) -> tuple[_FundamentalSnapshot, l
         return _FundamentalSnapshot(
             None, None, None, None, None, None, None, None, None, None, None, None
         ), [f"fundamentals yfinance failed: {e!s}"]
-    
+
     def _to_float(x: Any) -> float | None:
         try:
             if x is None:
@@ -122,7 +118,7 @@ def _extract_fundamentals_yfinance(ticker: str) -> tuple[_FundamentalSnapshot, l
             return float(Decimal(str(x)))
         except Exception:
             return None
-    
+
     pe = _to_float(info.get("trailingPE"))
     fwd_pe = _to_float(info.get("forwardPE"))
     pb = _to_float(info.get("priceToBook"))
@@ -133,8 +129,10 @@ def _extract_fundamentals_yfinance(ticker: str) -> tuple[_FundamentalSnapshot, l
     dte = _to_float(info.get("debtToEquity"))
     current_ratio = _to_float(info.get("currentRatio"))
     mc = _to_float(info.get("marketCap"))
+
     sector = info.get("sector")
     sector_pe_raw = _to_float(info.get("sectorPE"))
+
     return _FundamentalSnapshot(
         pe_ratio=pe or fwd_pe,
         forward_pe=fwd_pe,
@@ -155,10 +153,11 @@ class FeatureEngineer:
     def __init__(self, settings: IngestionSettings | None = None) -> None:
         self._s = settings or get_ingestion_settings()
         self._sentiment = PredictiveSentimentEngine(settings=self._s)
-   
+
     def build_features(self, ingestion: AssetIngestionResult) -> FeatureEngineeringResult:
         warnings: list[str] = []
         errors: list[str] = []
+
         try:
             bars_df = ohlcv_bars_to_dataframe(ingestion.bars)
         except Exception as e:
@@ -175,31 +174,35 @@ class FeatureEngineer:
                 errors=[f"failed to convert bars to DataFrame: {e!s}"],
                 as_of_utc=datetime.now(timezone.utc),
             )
-            
+
         if bars_df.empty or len(bars_df) < 30:
             warnings.append("insufficient history for technical indicators; using neutral technical features.")
+
         technical = self._compute_technical_scores(bars_df, ingestion.asset_class)
         sentiment_score, sentiment_breakdown, sentiment_warnings = self._sentiment.analyze(
             ticker=ingestion.ticker_resolved_yfinance,
             asset_class=ingestion.asset_class,
             headlines=ingestion.headlines,
         )
-        
         warnings.extend(sentiment_warnings)
         fundamentals, fw = self._compute_fundamentals_score(ingestion)
         warnings.extend(fw)
-        gpr_index, gpr_score = _gpr_mock(ingestion.ticker_resolved_yfinance)
-        geopolitics_score = float(gpr_score)
+
+        geo = compute_geopolitics(ingestion.asset_class)
+        geopolitics_score = float(geo.risk_score)
+        gpr_index = float(geo.risk_index)
+        warnings.extend(geo.warnings)
+
         # DecisionEngine weights come later (Module C). Here we produce group scores.
         signals: list[str] = []
         signals.extend(self._technical_signals(technical, bars_df))
         signals.extend(self._sentiment_signals(sentiment_score, sentiment_breakdown))
         signals.extend(self._fundamental_signals(fundamentals))
-        signals.append(f"GPR(mock) index={gpr_index:.0f}/100")
+        signals.extend(self._geopolitics_signals(geo))
+
         ml_vector = {}
         ml_vector.update(technical["ml_features"])
         ml_vector["sentiment_score"] = float(sentiment_score)
-        
         if sentiment_breakdown is not None:
             ml_vector["sentiment_pos_pct"] = float(sentiment_breakdown.positive_pct)
             ml_vector["sentiment_neg_pct"] = float(sentiment_breakdown.negative_pct)
@@ -207,8 +210,20 @@ class FeatureEngineer:
             ml_vector["sentiment_entity_match_rate"] = float(sentiment_breakdown.entity_match_rate)
             ml_vector["sentiment_avg_source_quality"] = float(sentiment_breakdown.avg_source_quality)
         ml_vector["gpr_score"] = geopolitics_score
+        ml_vector["gpr_index"] = gpr_index
+        ml_vector["vix_level"] = float(geo.vix_level)
+        ml_vector["vix_percentile"] = float(geo.vix_percentile)
+        ml_vector["oil_change_5d_pct"] = float(geo.oil_change_5d_pct)
+        ml_vector["oil_shock"] = 1.0 if geo.oil_shock else 0.0
+        if ingestion.asset_class == AssetClass.EQUITY_INDIA:
+            ml_vector["india_vix_level"] = float(geo.india_vix_level)
+            ml_vector["usdinr_change_5d_pct"] = float(geo.usdinr_change_5d_pct)
+            ml_vector["usdinr_stress"] = 1.0 if geo.usdinr_stress else 0.0
         ml_vector.update(fundamentals["ml_features"])
-        
+
+        regime = technical["ml_features"].get("regime_encoded", 0.0)
+        regime_str = "bull" if regime == 1.0 else ("bear" if regime == -1.0 else "sideways")
+
         return FeatureEngineeringResult(
             asset_class=ingestion.asset_class,
             technical_score=float(technical["score"]),
@@ -227,22 +242,23 @@ class FeatureEngineer:
             errors=errors,
             as_of_utc=datetime.now(timezone.utc),
         )
-    
-        async def build_features_async(self, ingestion: AssetIngestionResult) -> FeatureEngineeringResult:
+
+    async def build_features_async(self, ingestion: AssetIngestionResult) -> FeatureEngineeringResult:
         # Avoid blocking event loop: run in a thread.
         import asyncio
+
         return await asyncio.to_thread(self.build_features, ingestion)
-        
+
     # ------------------------------------------------------------------
     # Regime Detection
     # ------------------------------------------------------------------
-   
     @staticmethod
     def _detect_regime(
         close: pd.Series, sma50: float, sma200: float, adx: float
     ) -> str:
         """Classify market regime as 'bull', 'bear', or 'sideways'."""
         last_close = float(close.iloc[-1]) if len(close) > 0 else 0.0
+
         if adx < 20:
             return "sideways"
         if last_close > sma200 and sma50 > sma200:
@@ -250,17 +266,17 @@ class FeatureEngineer:
         if last_close < sma200 and sma50 < sma200:
             return "bear"
         return "sideways"
-    
+
     # ------------------------------------------------------------------
     # Technical Indicators (expanded)
     # ------------------------------------------------------------------
-   
     def _compute_technical_scores(self, bars_df: pd.DataFrame, asset_class: AssetClass) -> dict[str, Any]:
         close = bars_df["close"] if "close" in bars_df else pd.Series(dtype=float)
         high = bars_df["high"] if "high" in bars_df else pd.Series(dtype=float)
         low = bars_df["low"] if "low" in bars_df else pd.Series(dtype=float)
         volume = bars_df["volume"] if "volume" in bars_df else pd.Series(dtype=float)
         last_close = float(close.iloc[-1]) if len(close) else 0.0
+
         # Neutral defaults for all features
         neutral_ml = {
             "last_close": last_close,
@@ -272,12 +288,14 @@ class FeatureEngineer:
             "high_52w": 0.0, "low_52w": 0.0, "dist_to_high_pct": 0.0, "dist_to_low_pct": 0.0,
             "regime_encoded": 0.0,
         }
-        
+
         if close.empty or len(close) < 50:
             return {"score": 0.0, "ml_features": neutral_ml}
+
         # --- Existing: RSI, MACD, Bollinger ---
         rsi_series = ta.rsi(close, length=14)
         rsi = _safe_last(rsi_series)
+
         macd_df = ta.macd(close, fast=12, slow=26, signal=9)
         macd_col = next((c for c in macd_df.columns if "MACD_" in c or c.lower().startswith("macd_")), None)
         sig_col = next((c for c in macd_df.columns if "SIGNAL_" in c or c.lower().startswith("macds_")), None)
@@ -288,17 +306,17 @@ class FeatureEngineer:
             sig_col = [c for c in macd_df.columns if "signal" in c.lower()][0]
         if hist_col is None:
             hist_col = [c for c in macd_df.columns if "hist" in c.lower()][0]
+
         macd_val = _safe_last(macd_df[macd_col])
         macd_signal = _safe_last(macd_df[sig_col])
         macd_hist = _safe_last(macd_df[hist_col]) if hist_col else 0.0
-        
         if math.isnan(macd_hist):
             macd_hist = 0.0
+
         bb_df = ta.bbands(close, length=20, std=2)
         lower_col = next((c for c in bb_df.columns if str(c).upper().startswith("BBL")), None)
         mid_col = next((c for c in bb_df.columns if str(c).upper().startswith("BBM")), None)
         upper_col = next((c for c in bb_df.columns if str(c).upper().startswith("BBU")), None)
-        
         if lower_col is None or mid_col is None or upper_col is None:
             bb_lower = bb_mid = bb_upper = bb_width = 0.0
         else:
@@ -313,19 +331,20 @@ class FeatureEngineer:
                 bb_upper = 0.0
             width = (bb_upper - bb_lower)
             bb_width = float(width / last_close) if last_close != 0 else 0.0
-            
+
         # --- NEW: Trend (SMA50, SMA200, ADX) ---
-        
         sma50_series = ta.sma(close, length=50)
         sma50 = _safe_last(sma50_series)
         if math.isnan(sma50):
             sma50 = last_close
+
         sma200_val = last_close  # fallback if not enough data
         if len(close) >= 200:
             sma200_series = ta.sma(close, length=200)
             sma200_val = _safe_last(sma200_series)
             if math.isnan(sma200_val):
                 sma200_val = last_close
+
         adx_df = ta.adx(high, low, close, length=14)
         adx_val = 0.0
         if adx_df is not None and not adx_df.empty:
@@ -334,86 +353,75 @@ class FeatureEngineer:
                 adx_val = _safe_last(adx_df[adx_col])
                 if math.isnan(adx_val):
                     adx_val = 0.0
-                    
+
         # --- NEW: Volume (OBV, Relative Volume) ---
-        
         obv_series = ta.obv(close, volume)
         obv_val = _safe_last(obv_series) if obv_series is not None else 0.0
         if math.isnan(obv_val):
             obv_val = 0.0
-            
+
         # OBV slope: difference over last 5 days, normalized
-        
         obv_slope = 0.0
         if obv_series is not None and len(obv_series.dropna()) >= 6:
             obv_clean = obv_series.dropna()
             obv_diff = float(obv_clean.iloc[-1] - obv_clean.iloc[-6])
             obv_denom = max(abs(float(obv_clean.iloc[-6])), 1.0)
             obv_slope = obv_diff / obv_denom
-            
+
         # Relative volume: today's volume / 20-day average
-       
         rel_vol = 1.0
         if len(volume) >= 20:
             avg_vol = float(volume.iloc[-20:].mean())
             if avg_vol > 0:
                 rel_vol = float(volume.iloc[-1]) / avg_vol
-                
+
         # --- NEW: Volatility (ATR, Historical Vol) ---
-        
         atr_series = ta.atr(high, low, close, length=14)
         atr_val = _safe_last(atr_series) if atr_series is not None else 0.0
         if math.isnan(atr_val):
             atr_val = 0.0
         atr_pct = (atr_val / last_close * 100.0) if last_close > 0 else 0.0
-        
+
         # Historical volatility: annualized std of log returns over 20 days
-        
         hist_vol = 0.0
         if len(close) >= 21:
             log_returns = np.log(close.iloc[-21:] / close.iloc[-21:].shift(1)).dropna()
             if len(log_returns) >= 5:
                 hist_vol = float(log_returns.std() * np.sqrt(252) * 100)  # annualized %
-        
+
         # --- NEW: Support/Resistance (52w high/low distance) ---
-        
         lookback_52w = min(len(close), 252)
         high_52w = float(close.iloc[-lookback_52w:].max())
         low_52w = float(close.iloc[-lookback_52w:].min())
         dist_to_high_pct = ((last_close - high_52w) / high_52w * 100.0) if high_52w > 0 else 0.0
         dist_to_low_pct = ((last_close - low_52w) / low_52w * 100.0) if low_52w > 0 else 0.0
-        
+
         # --- Regime Detection ---
-        
         regime = self._detect_regime(close, sma50, sma200_val, adx_val)
-        
+
         # ==========================================
         # Score Computation
         # ==========================================
+
         # 1. RSI Score (regime-adjusted)
-        
         if math.isnan(rsi):
             rsi_score = 0.0
             rsi = 50.0  # neutral default for ml_features
         else:
             if regime == "bull":
-        
                 # In bull: RSI < 40 = oversold, RSI > 80 = overbought
                 rsi_score = _clamp((60.0 - rsi) / 25.0)
             elif regime == "bear":
-                
                 # In bear: RSI < 20 = oversold, RSI > 60 = overbought
                 rsi_score = _clamp((40.0 - rsi) / 25.0)
             else:
-                
                 # Sideways: standard 30/70
                 rsi_score = _clamp((50.0 - rsi) / 20.0)
-        
+
         # 2. MACD Score
-        
         scale = max(abs(last_close) * 0.01, 1e-9)
         macd_score = _clamp(macd_hist / scale)
-        
+
         # 3. Bollinger Score
         if bb_upper and bb_lower and bb_upper != bb_lower:
             bb_range = max(bb_upper - bb_lower, 1e-12)
@@ -421,47 +429,43 @@ class FeatureEngineer:
             bb_score = _clamp(-bb_pos)
         else:
             bb_score = 0.0
-        
+
         # 4. Trend Score (SMA cross + ADX strength)
         # Golden cross bias: SMA50 > SMA200 = bullish
         sma_cross_score = 0.0
         if sma200_val > 0:
             sma_ratio = (sma50 - sma200_val) / sma200_val
             sma_cross_score = _clamp(sma_ratio * 10.0)  # scaled
-        
+
         # ADX amplifies the trend signal; weak ADX dampens it
         adx_factor = min(adx_val / 25.0, 1.5) if adx_val > 0 else 0.5
         trend_score = _clamp(sma_cross_score * adx_factor)
-        
+
         # 5. Volume Score (OBV direction + volume confirmation)
         obv_direction_score = _clamp(obv_slope * 5.0)  # OBV rising = bullish
         vol_confirm = 0.0
         if rel_vol > 1.5:
-        
             # High volume confirms the current price direction
             vol_confirm = 0.3 if (close.iloc[-1] > close.iloc[-2] if len(close) >= 2 else True) else -0.3
         volume_score = _clamp(0.6 * obv_direction_score + 0.4 * vol_confirm)
-        
+
         # 6. Volatility Score (high vol = caution → slightly negative)
         volatility_score = 0.0
         if atr_pct > 0:
-        
             # ATR% > 3% is high for equities, > 5% is very high
             vol_threshold = 5.0 if asset_class in {AssetClass.CRYPTO, AssetClass.COMMODITY} else 3.0
             volatility_score = _clamp(-(atr_pct - vol_threshold * 0.5) / vol_threshold)
-        
+
         # 7. Support/Resistance Score
         # Near 52w low (within 10%) = buy bias; near 52w high (within 5%) = sell bias
         sr_score = 0.0
         if dist_to_high_pct > -5.0:
-        
             # Near high → mildly bearish (resistance)
             sr_score = _clamp(-0.5 * (1.0 + dist_to_high_pct / 5.0))
         elif dist_to_low_pct < 10.0:
-            
             # Near low → mildly bullish (support)
             sr_score = _clamp(0.5 * (1.0 - dist_to_low_pct / 10.0))
-        
+
         # ==========================================
         # Composite Technical Score
         # ==========================================
@@ -474,9 +478,9 @@ class FeatureEngineer:
             + 0.10 * volatility_score
             + 0.10 * sr_score
         )
+
         ml_features = {
             "last_close": last_close,
-        
             # Momentum (existing)
             "rsi14": float(rsi),
             "macd": float(macd_val) if not math.isnan(macd_val) else 0.0,
@@ -486,37 +490,31 @@ class FeatureEngineer:
             "bb_mid": float(bb_mid),
             "bb_upper": float(bb_upper),
             "bb_width": float(bb_width),
-            
             # Trend (new)
             "sma50": float(sma50),
             "sma200": float(sma200_val),
             "adx": float(adx_val),
-            
             # Volume (new)
             "obv": float(obv_val),
             "obv_slope": float(obv_slope),
             "relative_volume": float(rel_vol),
-            
             # Volatility (new)
             "atr14": float(atr_val),
             "atr_pct": float(atr_pct),
             "hist_volatility_20d": float(hist_vol),
-            
             # Support/Resistance (new)
             "high_52w": float(high_52w),
             "low_52w": float(low_52w),
             "dist_to_high_pct": float(dist_to_high_pct),
             "dist_to_low_pct": float(dist_to_low_pct),
-            
-            # Regime (new)
-            "regime": regime,
-            
+            # Regime (new) — encoded numerically for ML: bull=1.0, bear=-1.0, sideways=0.0
+            "regime_encoded": 1.0 if regime == "bull" else (-1.0 if regime == "bear" else 0.0),
             # Composite
             "technical_score": float(technical_score),
         }
+
         return {"score": technical_score, "ml_features": ml_features}
-    
-    
+
     # ------------------------------------------------------------------
     # Fundamentals (expanded)
     # ------------------------------------------------------------------
@@ -532,8 +530,9 @@ class FeatureEngineer:
                 "fundamentals_score": 0.0,
             }
             return {"score": 0.0, "ml_features": ml}, [f"fundamentals neutral for asset_class={ingestion.asset_class}"]
+
         snapshot, warnings = _extract_fundamentals_yfinance(ingestion.ticker_resolved_yfinance)
-        
+
         # --- Sector-relative P/E ---
         sector_pe_ref = _DEFAULT_SECTOR_PE
         if snapshot.sector_pe and snapshot.sector_pe > 0:
@@ -542,42 +541,38 @@ class FeatureEngineer:
             sector_pe_ref = _SECTOR_PE_DEFAULTS.get(
                 snapshot.sector.lower(), _DEFAULT_SECTOR_PE
             )
+
         pe = snapshot.pe_ratio
         pe_relative_score = 0.0
         if pe is not None and pe > 0 and sector_pe_ref > 0:
-        
             # pe < sector_pe → undervalued (+), pe > sector_pe → expensive (−)
             pe_relative_score = _clamp((sector_pe_ref - pe) / sector_pe_ref)
-        
+
         # --- P/B Score ---
         pb = snapshot.price_to_book
         pb_score = 0.0
         if pb is not None and pb > 0:
-        
             # < 1.0 → strong value (+1), 1-3 → neutral, > 3 → expensive (−1)
             pb_score = _clamp((2.0 - pb) / 2.0)
-        
+
         # --- EV/EBITDA Score ---
         ev_ebitda = snapshot.ev_to_ebitda
         ev_ebitda_score = 0.0
         if ev_ebitda is not None and ev_ebitda > 0:
-        
             # < 10 → cheap (+), 10-15 → fair, > 20 → expensive (−)
             ev_ebitda_score = _clamp((12.0 - ev_ebitda) / 10.0)
-        
+
         # --- Revenue Growth Score ---
         rev_growth = snapshot.revenue_growth
         growth_score = 0.0
         if rev_growth is not None:
-        
             # +20% growth → +1; −20% → −1; 0% → 0
             growth_score = _clamp(rev_growth / 0.20)
-        
+
         # --- Margin Score (profit + operating margins) ---
         margin_score = 0.0
         margin_count = 0
         if snapshot.profit_margins is not None:
-        
             # > 0.15 healthy (+), < 0.05 weak (−)
             pm_score = _clamp((snapshot.profit_margins - 0.10) / 0.10)
             margin_score += pm_score
@@ -588,36 +583,33 @@ class FeatureEngineer:
             margin_count += 1
         if margin_count > 0:
             margin_score /= margin_count
-        
+
         # --- Debt Score ---
         dte = snapshot.debt_to_equity
         debt_score = 0.0
         if dte is not None:
-        
             # D/E: < 50 good (+), > 200 risky (−). yfinance reports as percentage (e.g. 120 = 1.2x)
             debt_score = _clamp((100.0 - dte) / 100.0)
-        
+
         # --- Liquidity Score ---
         cr = snapshot.current_ratio
         liquidity_score = 0.0
         if cr is not None and cr > 0:
-        
             # > 1.5 liquid (+), < 1.0 risky (−)
             liquidity_score = _clamp((cr - 1.0) / 0.5)
-        
+
         # --- India-Specific Enrichment ---
         india_bonus = 0.0
         if ingestion.asset_class == AssetClass.EQUITY_INDIA:
-        
             # Delivery % score: > 50% institutional conviction (+), < 30% speculative (−)
             if ingestion.nse_delivery_pct is not None:
                 india_bonus += _clamp((ingestion.nse_delivery_pct - 40.0) / 20.0) * 0.05
-            
+
             # FII flow score: net positive = bullish
             if ingestion.nse_fii_net_buy_cr is not None:
                 fii_score = _clamp(ingestion.nse_fii_net_buy_cr / 2000.0)  # ±2000cr scale
                 india_bonus += fii_score * 0.05
-        
+
         # --- Composite Fundamentals Score ---
         fundamentals_score = float(
             0.20 * pe_relative_score
@@ -629,6 +621,7 @@ class FeatureEngineer:
             + 0.10 * liquidity_score
             + india_bonus  # ±0.10 max for India
         )
+
         ml_features = {
             "pe_ratio": float(pe) if pe is not None else 0.0,
             "price_to_book": float(pb) if pb is not None else 0.0,
@@ -641,14 +634,15 @@ class FeatureEngineer:
             "market_cap": float(snapshot.market_cap) if snapshot.market_cap is not None else 0.0,
             "fundamentals_score": float(fundamentals_score),
         }
-        
+
         # Add India-specific ML features
         if ingestion.asset_class == AssetClass.EQUITY_INDIA:
             ml_features["nse_delivery_pct"] = float(ingestion.nse_delivery_pct or 0.0)
             ml_features["nse_fii_net_buy_cr"] = float(ingestion.nse_fii_net_buy_cr or 0.0)
             ml_features["nse_dii_net_buy_cr"] = float(ingestion.nse_dii_net_buy_cr or 0.0)
+
         return {"score": fundamentals_score, "ml_features": ml_features}, warnings
-    
+
     # ------------------------------------------------------------------
     # Signal Generation (expanded)
     # ------------------------------------------------------------------
@@ -668,55 +662,56 @@ class FeatureEngineer:
         atr_pct = ml.get("atr_pct", 0.0)
         dist_high = ml.get("dist_to_high_pct", 0.0)
         dist_low = ml.get("dist_to_low_pct", 0.0)
+
         out: list[str] = []
-    
+
         # Regime
         out.append(f"Market regime: {regime.upper()} (ADX={adx:.1f})")
-        
+
         # RSI
         if rsi <= 30:
             out.append("RSI is oversold (potential BUY pressure).")
         elif rsi >= 70:
             out.append("RSI is overbought (potential SELL pressure).")
-        
+
         # MACD
         if macd_hist > 0:
             out.append("MACD histogram is positive (momentum supportive).")
         elif macd_hist < 0:
             out.append("MACD histogram is negative (momentum bearish).")
-        
+
         # Bollinger
         if bb_lower and bb_upper:
             if last_close <= bb_lower:
                 out.append("Price near/below lower Bollinger band (oversold bias).")
             elif last_close >= bb_upper:
                 out.append("Price near/above upper Bollinger band (overbought bias).")
-        
+
         # Trend (SMA cross)
         if sma50 > 0 and sma200 > 0:
             if sma50 > sma200 * 1.02:
                 out.append(f"Golden cross: SMA50 ({sma50:.2f}) > SMA200 ({sma200:.2f}) — bullish trend.")
             elif sma50 < sma200 * 0.98:
                 out.append(f"Death cross: SMA50 ({sma50:.2f}) < SMA200 ({sma200:.2f}) — bearish trend.")
-        
+
         # Volume
         if rel_vol > 2.0:
             out.append(f"Volume surge: {rel_vol:.1f}× the 20-day average — high conviction move.")
         elif rel_vol > 1.5:
             out.append(f"Above-average volume ({rel_vol:.1f}×) — confirms recent price action.")
-        
+
         # Volatility
         if atr_pct > 4.0:
             out.append(f"High volatility: ATR = {atr_pct:.1f}% of price — caution advised.")
-        
+
         # Support/Resistance
         if dist_high > -3.0:
             out.append(f"Price near 52-week high ({dist_high:+.1f}%) — resistance zone.")
         elif dist_low < 5.0:
             out.append(f"Price near 52-week low ({dist_low:+.1f}%) — potential support zone.")
+
         return out
-    
-    
+
     def _sentiment_signals(self, score: float, breakdown: SentimentBreakdown | None = None) -> list[str]:
         out: list[str] = []
         if score >= 0.2:
@@ -732,34 +727,36 @@ class FeatureEngineer:
                 f"entity match={breakdown.entity_match_rate:.0%}, method={breakdown.method}."
             )
         return out
-    
-    
+
     def _fundamental_signals(self, fundamentals: dict[str, Any]) -> list[str]:
         score = float(fundamentals.get("score") or 0.0)
         ml = fundamentals.get("ml_features", {})
         out: list[str] = []
+
         if score >= 0.2:
             out.append(f"Fundamentals look relatively stronger (score={score:.2f}).")
         elif score <= -0.2:
             out.append(f"Fundamentals indicate elevated risk (score={score:.2f}).")
         else:
             out.append("Fundamentals are neutral or missing.")
-    
+
         # Add specific callouts for notable metrics
         rev_g = ml.get("revenue_growth", 0.0)
         if rev_g > 0.15:
             out.append(f"Revenue growing at {rev_g:.0%} — strong growth signal.")
         elif rev_g < -0.05:
             out.append(f"Revenue declining at {rev_g:.0%} — contraction warning.")
+
         pe = ml.get("pe_ratio", 0.0)
         if pe > 40:
             out.append(f"P/E ratio is elevated at {pe:.1f}× — priced for high growth.")
         elif 0 < pe < 10:
             out.append(f"P/E ratio is low at {pe:.1f}× — potential value opportunity.")
+
         dte = ml.get("debt_to_equity", 0.0)
         if dte > 200:
             out.append(f"High leverage: D/E = {dte:.0f}% — balance sheet risk.")
-        
+
         # India-specific
         nse_del = ml.get("nse_delivery_pct", 0.0)
         if nse_del > 0:
@@ -767,9 +764,55 @@ class FeatureEngineer:
                 out.append(f"NSE delivery at {nse_del:.0f}% — strong institutional conviction.")
             elif nse_del < 30:
                 out.append(f"NSE delivery at {nse_del:.0f}% — speculative activity dominant.")
+
         nse_fii = ml.get("nse_fii_net_buy_cr", 0.0)
         if nse_fii != 0.0:
             direction = "buying" if nse_fii > 0 else "selling"
             out.append(f"FII net {direction}: ₹{abs(nse_fii):.0f} Cr.")
+
         return out
-        
+
+    def _geopolitics_signals(self, geo: GeopoliticsResult) -> list[str]:
+        out: list[str] = []
+
+        # Overall risk bucket
+        bucket_emoji = {
+            "low": "🟢", "medium": "🟡", "high": "🟠", "extreme": "🔴",
+        }
+        emoji = bucket_emoji.get(geo.risk_bucket, "⚪")
+        out.append(
+            f"Geopolitical risk: {emoji} {geo.risk_bucket.upper()} "
+            f"(index={geo.risk_index:.0f}/100, score={geo.risk_score:+.2f})"
+        )
+
+        # VIX detail
+        if geo.vix_level > 0:
+            if geo.vix_level > 30:
+                out.append(f"VIX at {geo.vix_level:.1f} — elevated fear, high volatility expected.")
+            elif geo.vix_level > 20:
+                out.append(f"VIX at {geo.vix_level:.1f} — above-average caution.")
+            elif geo.vix_level < 15:
+                out.append(f"VIX at {geo.vix_level:.1f} — markets are calm.")
+
+        # Oil shock
+        if geo.oil_shock:
+            direction = "spike" if geo.oil_change_5d_pct > 0 else "crash"
+            out.append(
+                f"Oil {direction}: {geo.oil_change_5d_pct:+.1f}% in 5 days — "
+                f"geopolitical/supply risk signal."
+            )
+
+        # India-specific
+        if geo.india_vix_level > 0:
+            if geo.india_vix_level > 20:
+                out.append(f"India VIX at {geo.india_vix_level:.1f} — domestic volatility elevated.")
+            elif geo.india_vix_level < 12:
+                out.append(f"India VIX at {geo.india_vix_level:.1f} — domestic calm.")
+
+        if geo.usdinr_stress:
+            out.append(
+                f"USD/INR stress: INR depreciated {geo.usdinr_change_5d_pct:+.2f}% in 5 days — "
+                f"FII outflow / macro risk."
+            )
+
+        return out
