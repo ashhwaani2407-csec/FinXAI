@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 
+from backend.schemas.data_quality import DataQualityGrade, DataQualityReport
 from backend.schemas.decision import DecisionLabel, DecisionResult, TradeAction
 from backend.schemas.features import FeatureEngineeringResult
 from backend.schemas.ingestion import AssetClass
@@ -103,6 +104,23 @@ class DecisionEngine:
                 errors=errors,
             )
 
+        dq = features.data_quality
+        if dq is not None and not dq.is_tradeable:
+            hold_reason = dq.summary or "Insufficient data — HOLD only."
+            dq_reasoning = [hold_reason]
+            if dq.flags:
+                dq_reasoning.append("Data quality flags: " + "; ".join(dq.flags[:5]))
+            return DecisionResult(
+                label=DecisionLabel.RISKY_AVOID,
+                action=TradeAction.HOLD,
+                confidence_pct=0.0,
+                score=0.0,
+                reasoning=reasoning + dq_reasoning,
+                warnings=warnings
+                + [f"Data quality {dq.score:.0f}/100 ({dq.grade.value}) — directional action blocked."],
+                errors=errors,
+            )
+
         # Ensure group scores are within [-1, 1].
         t = _clamp(float(features.technical_score), -1.0, 1.0)
         s = _clamp(float(features.sentiment_score), -1.0, 1.0)
@@ -132,6 +150,8 @@ class DecisionEngine:
                 blended_p = _clamp(alpha * proba_trade + (1.0 - alpha) * heur_p, 0.0, 1.0)
                 score = float(2.0 * blended_p - 1.0)
                 confidence = float(_clamp(blended_p * 100.0, 0.0, 100.0))
+                confidence, dq_warnings = self._apply_data_quality_confidence(confidence, dq)
+                warnings.extend(dq_warnings)
                 label, action = self._label_and_action_from_score(score, features.asset_class, confidence)
                 return DecisionResult(
                     label=label,
@@ -170,6 +190,8 @@ class DecisionEngine:
         conf = 50.0 + 45.0 * _sigmoid(4.0 * abs(score))  # 50..~95
         conf = float(_clamp(conf, 0.0, 100.0))
 
+        conf, dq_warnings = self._apply_data_quality_confidence(conf, dq)
+        warnings.extend(dq_warnings)
         label, action = self._label_and_action_from_score(score, features.asset_class, conf)
 
         # Add compact explanation of the weight mix for transparency.
@@ -188,6 +210,18 @@ class DecisionEngine:
             warnings=warnings,
             errors=[],
         )
+
+    @staticmethod
+    def _apply_data_quality_confidence(
+        confidence_pct: float,
+        dq: DataQualityReport | None,
+    ) -> tuple[float, list[str]]:
+        if dq is None or dq.grade != DataQualityGrade.LOW:
+            return confidence_pct, []
+        capped = float(_clamp(confidence_pct * (dq.score / 100.0), 0.0, 100.0))
+        return capped, [
+            f"Marginal data quality ({dq.score:.0f}/100); confidence reduced {confidence_pct:.1f}% → {capped:.1f}%."
+        ]
 
     def _label_and_action_from_score(
         self,

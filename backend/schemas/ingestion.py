@@ -9,6 +9,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from backend.schemas.data_quality import DataQualityReport
+
 
 class AssetClass(StrEnum):
     EQUITY_GLOBAL = "equity_global"
@@ -87,9 +89,12 @@ class AssetIngestionResult(BaseModel):
     nse_fii_net_buy_cr: float | None = None      # FII net buy in ₹ crores (recent)
     nse_dii_net_buy_cr: float | None = None      # DII net buy in ₹ crores (recent)
 
+    data_quality: DataQualityReport | None = None
+
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     fetched_at_utc: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    ingestion_cache_hit: bool = False
 
     def is_success(self) -> bool:
         return not self.errors and bool(self.bars)

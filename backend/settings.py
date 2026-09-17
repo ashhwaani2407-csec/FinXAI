@@ -105,6 +105,24 @@ class IngestionSettings(BaseSettings):
         description="If FinBERT fails to load or score, use keyword heuristics instead of returning 0 silently.",
     )
 
+    # --- Module A: data quality + ingestion cache ---
+    data_quality_min_score: float = Field(
+        default=45.0,
+        ge=0.0,
+        le=100.0,
+        description="Minimum reliability score (0–100) before BUY/SELL is allowed.",
+    )
+    ingestion_cache_enabled: bool = Field(
+        default=True,
+        description="Cache OHLCV/headlines per ticker to reduce upstream rate limits.",
+    )
+    ingestion_cache_ttl_seconds: int = Field(
+        default=600,
+        ge=300,
+        le=900,
+        description="Per-ticker ingestion TTL (5–15 minutes). Features/decision always recomputed.",
+    )
+
 
 @lru_cache(maxsize=1)
 def get_ingestion_settings() -> IngestionSettings:

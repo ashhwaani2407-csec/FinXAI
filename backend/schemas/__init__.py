@@ -11,6 +11,7 @@ from .ingestion import (
 
 from .features import FeatureEngineeringResult
 from .sentiment import HeadlineSentimentDetail, SentimentBreakdown
+from .data_quality import DataQualityGrade, DataQualityReport
 from .decision import DecisionLabel, DecisionResult, TradeAction
 
 from .recommendation import (
@@ -33,6 +34,8 @@ __all__ = [
     "FeatureEngineeringResult",
     "HeadlineSentimentDetail",
     "SentimentBreakdown",
+    "DataQualityGrade",
+    "DataQualityReport",
     "DecisionLabel",
     "DecisionResult",
     "TradeAction",

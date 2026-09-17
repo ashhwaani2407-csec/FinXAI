@@ -178,6 +178,12 @@ class FeatureEngineer:
         if bars_df.empty or len(bars_df) < 30:
             warnings.append("insufficient history for technical indicators; using neutral technical features.")
 
+        dq = ingestion.data_quality
+        if dq is not None:
+            warnings.append(f"data quality {dq.score:.0f}/100 ({dq.grade.value})")
+            if dq.flags:
+                warnings.extend(dq.flags[:3])
+
         technical = self._compute_technical_scores(bars_df, ingestion.asset_class)
         sentiment_score, sentiment_breakdown, sentiment_warnings = self._sentiment.analyze(
             ticker=ingestion.ticker_resolved_yfinance,
@@ -238,6 +244,7 @@ class FeatureEngineer:
             sentiment_per_headline_scores=[d.score for d in (sentiment_breakdown.headline_details if sentiment_breakdown else [])],
             sentiment_breakdown=sentiment_breakdown,
             market_regime=regime_str,
+            data_quality=dq,
             warnings=warnings,
             errors=errors,
             as_of_utc=datetime.now(timezone.utc),

@@ -328,7 +328,32 @@ def main():
         with col_right:
             st.subheader("AI Recommendation Card")
             color = _action_color(decision.action)
-            st.caption(f"Resolved symbol: **{ingestion.ticker_resolved_yfinance}**")
+            cache_note = " · cached ingestion" if ingestion.ingestion_cache_hit else ""
+            st.caption(f"Resolved symbol: **{ingestion.ticker_resolved_yfinance}**{cache_note}")
+            dq = ingestion.data_quality or features.data_quality
+            if dq is not None:
+                dq_color = "#22c55e" if dq.grade.value == "high" else (
+                    "#eab308" if dq.grade.value == "medium" else "#f97316"
+                )
+                if not dq.is_tradeable:
+                    dq_color = "#ef4444"
+                st.markdown(
+                    f"""
+                    <div class="fi-card" style="margin-bottom:12px;">
+                      <div style="font-size:13px; color:#94a3b8;">Data reliability</div>
+                      <div style="font-size:22px; font-weight:700; color:{dq_color};">
+                        {dq.score:.0f}/100 · {dq.grade.value}
+                      </div>
+                      <div style="margin-top:6px; font-size:12px; color:#cbd5e1;">
+                        {dq.summary}
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                if dq.flags:
+                    with st.expander("Data quality flags", expanded=not dq.is_tradeable):
+                        st.markdown("\n".join([f"- {f}" for f in dq.flags[:8]]))
             st.markdown(
                 f"""
                 <div class="fi-card">
@@ -606,6 +631,8 @@ def main():
     for item in items:
         it = item if isinstance(item, dict) else item.model_dump()
         decision = it.get("decision") or {}
+        ingestion = it.get("ingestion") or {}
+        dq = ingestion.get("data_quality") or {}
         rows.append(
             {
                 "Ticker": it.get("ticker"),
@@ -614,6 +641,8 @@ def main():
                 "Label": decision.get("label"),
                 "Confidence %": round(float(decision.get("confidence_pct") or 0.0), 2),
                 "Score": round(float(decision.get("score") or 0.0), 4),
+                "Data Quality": dq.get("score"),
+                "Tradeable": dq.get("is_tradeable"),
             }
         )
     st.subheader("Batch Comparison")

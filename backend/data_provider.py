@@ -28,6 +28,8 @@ from tenacity import (
     wait_exponential,
 )
 
+from backend.data_quality import assess_data_quality
+from backend.ingestion_cache import IngestionCacheKey, get_ingestion_cache
 from backend.schemas.ingestion import (
     AssetClass,
     AssetIngestionResult,
@@ -91,35 +93,72 @@ class MultiAssetDataProvider:
         self._http_user_agent = self._s.user_agent
 
     def ingest(self, ticker: str) -> AssetIngestionResult:
-        warnings: list[str] = []
-        errors: list[str] = []
         try:
             ctx = self._classify_ticker(ticker)
         except ValueError as e:
-            return AssetIngestionResult(
+            result = AssetIngestionResult(
                 ticker_requested=ticker.strip(),
                 ticker_resolved_yfinance=ticker.strip(),
                 asset_class=AssetClass.EQUITY_GLOBAL,
                 history_source=None,
                 errors=[str(e)],
             )
+            result.data_quality = assess_data_quality(result, self._s)
+            return result
 
-        bars, hsrc, hw, he = self._fetch_history(ctx)
-        warnings.extend(hw)
-        errors.extend(he)
+        cache_key = IngestionCacheKey.from_settings(ctx.yfinance_ticker, self._s)
+        if self._s.ingestion_cache_enabled:
+            cached = get_ingestion_cache().get(cache_key)
+            if cached is not None:
+                return self._finalize_cached_ingestion(cached, ctx)
 
-        headlines, nw = self._fetch_headlines(ctx)
-        warnings.extend(nw)
+        result = self._ingest_from_context(ctx)
+        if self._s.ingestion_cache_enabled:
+            get_ingestion_cache().set(cache_key, result, self._s.ingestion_cache_ttl_seconds)
+        return result
 
-        # India-specific enrichment (delivery %, FII/DII flows).
+    async def ingest_async(self, ticker: str) -> AssetIngestionResult:
+        """Run ingestion without blocking the event loop (Parallel history + news)."""
+        try:
+            ctx = self._classify_ticker(ticker)
+        except ValueError as e:
+            result = AssetIngestionResult(
+                ticker_requested=ticker.strip(),
+                ticker_resolved_yfinance=ticker.strip(),
+                asset_class=AssetClass.EQUITY_GLOBAL,
+                history_source=None,
+                errors=[str(e)],
+            )
+            result.data_quality = assess_data_quality(result, self._s)
+            return result
+
+        cache_key = IngestionCacheKey.from_settings(ctx.yfinance_ticker, self._s)
+        if self._s.ingestion_cache_enabled:
+            cached = get_ingestion_cache().get(cache_key)
+            if cached is not None:
+                return self._finalize_cached_ingestion(cached, ctx)
+
+        loop = asyncio.get_running_loop()
+        hist_fut = loop.run_in_executor(None, lambda: self._fetch_history(ctx))
+        news_fut = loop.run_in_executor(None, lambda: self._fetch_headlines(ctx))
+
+        (bars, hsrc, hw, he) = await hist_fut
+        (headlines, nw) = await news_fut
+
+        warnings = list(hw) + list(nw)
+        errors = list(he)
+
         nse_delivery_pct = None
         nse_fii_net = None
         nse_dii_net = None
         if ctx.asset_class == AssetClass.EQUITY_INDIA and ctx.nse_symbol:
-            nse_delivery_pct, nse_fii_net, nse_dii_net, ew = self._fetch_nse_enrichment(ctx.nse_symbol)
+            enrich_fut = loop.run_in_executor(
+                None, lambda: self._fetch_nse_enrichment(ctx.nse_symbol)
+            )
+            nse_delivery_pct, nse_fii_net, nse_dii_net, ew = await enrich_fut
             warnings.extend(ew)
 
-        return AssetIngestionResult(
+        result = AssetIngestionResult(
             ticker_requested=ctx.requested,
             ticker_resolved_yfinance=ctx.yfinance_ticker,
             asset_class=ctx.asset_class,
@@ -132,37 +171,54 @@ class MultiAssetDataProvider:
             warnings=warnings,
             errors=errors,
         )
+        result.data_quality = assess_data_quality(result, self._s)
+        if self._s.ingestion_cache_enabled:
+            get_ingestion_cache().set(cache_key, result, self._s.ingestion_cache_ttl_seconds)
+        return result
 
-    async def ingest_async(self, ticker: str) -> AssetIngestionResult:
-        """Run ingestion without blocking the event loop (Parallel history + news)."""
-        try:
-            ctx = self._classify_ticker(ticker)
-        except ValueError as e:
-            return AssetIngestionResult(
-                ticker_requested=ticker.strip(),
-                ticker_resolved_yfinance=ticker.strip(),
-                asset_class=AssetClass.EQUITY_GLOBAL,
-                history_source=None,
-                errors=[str(e)],
-            )
+    def _finalize_cached_ingestion(
+        self, cached: AssetIngestionResult, ctx: _TickerContext
+    ) -> AssetIngestionResult:
+        """Apply current request metadata to a cache hit; features/decision still recompute."""
+        result = cached.model_copy(deep=True)
+        result.ticker_requested = ctx.requested
+        result.ingestion_cache_hit = True
+        result.data_quality = assess_data_quality(result, self._s)
+        return result
 
-        loop = asyncio.get_running_loop()
-        hist_fut = loop.run_in_executor(None, lambda: self._fetch_history(ctx))
-        news_fut = loop.run_in_executor(None, lambda: self._fetch_headlines(ctx))
+    def _ingest_from_context(self, ctx: _TickerContext) -> AssetIngestionResult:
+        warnings: list[str] = []
+        errors: list[str] = []
 
-        (bars, hsrc, hw, he) = await hist_fut
-        (headlines, nw) = await news_fut
+        bars, hsrc, hw, he = self._fetch_history(ctx)
+        warnings.extend(hw)
+        errors.extend(he)
 
-        return AssetIngestionResult(
+        headlines, nw = self._fetch_headlines(ctx)
+        warnings.extend(nw)
+
+        nse_delivery_pct = None
+        nse_fii_net = None
+        nse_dii_net = None
+        if ctx.asset_class == AssetClass.EQUITY_INDIA and ctx.nse_symbol:
+            nse_delivery_pct, nse_fii_net, nse_dii_net, ew = self._fetch_nse_enrichment(ctx.nse_symbol)
+            warnings.extend(ew)
+
+        result = AssetIngestionResult(
             ticker_requested=ctx.requested,
             ticker_resolved_yfinance=ctx.yfinance_ticker,
             asset_class=ctx.asset_class,
             history_source=hsrc,
             bars=bars,
             headlines=headlines,
-            warnings=list(hw) + list(nw),
-            errors=list(he),
+            nse_delivery_pct=nse_delivery_pct,
+            nse_fii_net_buy_cr=nse_fii_net,
+            nse_dii_net_buy_cr=nse_dii_net,
+            warnings=warnings,
+            errors=errors,
         )
+        result.data_quality = assess_data_quality(result, self._s)
+        return result
 
     def _classify_ticker(self, raw: str) -> _TickerContext:
         t = raw.strip()

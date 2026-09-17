@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.schemas.data_quality import DataQualityReport
 from backend.schemas.sentiment import SentimentBreakdown
 from backend.schemas.ingestion import AssetClass
 
@@ -45,6 +46,8 @@ class FeatureEngineeringResult(BaseModel):
 
     # Market regime (bull/bear/sideways) from technical analysis.
     market_regime: str = Field(default="sideways")
+
+    data_quality: DataQualityReport | None = None
 
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
