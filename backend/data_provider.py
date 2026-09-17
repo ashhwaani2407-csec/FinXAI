@@ -431,6 +431,34 @@ class MultiAssetDataProvider:
 
         return rows
 
+    def _download_fii_dii_activity(self) -> pd.DataFrame:
+        """Fetch daily FII/DII cash-market flows from NSE."""
+        try:
+            from nselib.capital_market.capital_market_data import fii_dii_trading_activity
+
+            return fii_dii_trading_activity()
+        except Exception as nselib_err:
+            logger.debug("nselib FII/DII import/fetch failed: %s", nselib_err)
+
+        # Direct fallback — same endpoint nselib uses internally.
+        session = requests.Session()
+        headers = {
+            "User-Agent": self._http_user_agent,
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.nseindia.com/reports/fii-dii",
+        }
+        session.get("https://www.nseindia.com", headers=headers, timeout=self._s.http_timeout_seconds)
+        resp = session.get(
+            "https://www.nseindia.com/api/fiidiiTradeReact",
+            headers=headers,
+            timeout=self._s.http_timeout_seconds,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        if not isinstance(payload, list):
+            raise ValueError("unexpected NSE FII/DII payload")
+        return pd.DataFrame(payload)
+
     @staticmethod
     def _first_present(df: pd.DataFrame, candidates: list[str]) -> str | None:
         cols = {c: c for c in df.columns}
@@ -477,17 +505,15 @@ class MultiAssetDataProvider:
             logger.warning("NSE delivery %% fetch failed for %s: %s", nse_symbol, e)
             warnings.append(f"NSE delivery % unavailable: {e!s}")
 
-        # 2. FII/DII flows
+        # 2. FII/DII flows (nselib 2.4+ keeps this on capital_market_data, not __init__)
         try:
-            from nselib import capital_market as cm
-
-            fii_dii = cm.fii_dii_trading_activity()
+            fii_dii = self._download_fii_dii_activity()
             if fii_dii is not None and not fii_dii.empty:
                 fii_dii = self._scrub_nselib_columns(fii_dii)
-                # Columns typically: Category, Buy Value, Sell Value, Net Value
                 cat_col = self._first_present(fii_dii, ["Category", "category"])
                 net_col = self._first_present(
-                    fii_dii, ["Net Value(Rs Crores)", "Net Value", "NetValue"]
+                    fii_dii,
+                    ["Net Value(Rs Crores)", "Net Value", "NetValue", "netValue"],
                 )
                 if cat_col and net_col:
                     for _, row in fii_dii.iterrows():
@@ -502,6 +528,8 @@ class MultiAssetDataProvider:
                             fii_net = net_val
                         elif "DII" in cat:
                             dii_net = net_val
+                else:
+                    warnings.append("NSE FII/DII response schema changed; net flows skipped.")
         except Exception as e:
             logger.warning("NSE FII/DII fetch failed: %s", e)
             warnings.append(f"NSE FII/DII data unavailable: {e!s}")
